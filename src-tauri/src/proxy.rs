@@ -46,7 +46,7 @@ pub struct ProxyStats {
 
 struct ActiveSession {
     write: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TlsStream>>>,
-    server_cipher: Arc<tokio::sync::Mutex<Cipher>>,
+    send_cipher: Arc<tokio::sync::Mutex<Cipher>>,
     streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
     next_sid: Arc<tokio::sync::Mutex<u32>>,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
@@ -135,8 +135,8 @@ impl ProxyState {
         let client_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"server-enc");
 
-        let client_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&client_enc_key)));
-        let server_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&server_enc_key)));
+        let send_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&client_enc_key)));
+        let recv_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&server_enc_key)));
         let cancel = tokio_util::sync::CancellationToken::new();
         let streams: Arc<Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -146,7 +146,7 @@ impl ProxyState {
 
         let session = ActiveSession {
             write: Arc::new(tokio::sync::Mutex::new(tls_w)),
-            server_cipher: server_cipher.clone(),
+            send_cipher: send_cipher.clone(),
             streams: streams.clone(),
             next_sid: next_sid.clone(),
             bytes_sent: bytes_sent.clone(),
@@ -162,7 +162,7 @@ impl ProxyState {
 
         self.start_reader_loop(
             tls_r,
-            client_cipher,
+            recv_cipher,
             streams.clone(),
             bytes_recv.clone(),
             cancel.clone(),
@@ -279,16 +279,26 @@ impl ProxyState {
                 match frame.header.command {
                     MuxCommand::Data => {
                         let data = frame.real_data().to_vec();
+                        let sid = frame.header.stream_id;
+                        log::info!("reader: Data frame sid={} len={}", sid, data.len());
                         bytes_recv.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let mut streams = streams.lock().await;
-                        if let Some(w) = streams.get_mut(&frame.header.stream_id) {
+                        if let Some(w) = streams.get_mut(&sid) {
                             let _ = w.write_all(&data).await;
+                        } else {
+                            log::warn!("reader: no stream for sid={}", sid);
                         }
                     }
                     MuxCommand::Close => {
+                        log::info!("reader: Close frame sid={}", frame.header.stream_id);
                         streams.lock().await.remove(&frame.header.stream_id);
                     }
-                    _ => {}
+                    MuxCommand::NewStream => {
+                        log::info!("reader: NewStream ack sid={}", frame.header.stream_id);
+                    }
+                    _ => {
+                        log::info!("reader: frame cmd={:?} sid={}", frame.header.command, frame.header.stream_id);
+                    }
                 }
             }
         });
@@ -299,6 +309,7 @@ async fn handle_socks5(
     mut sock: tokio::net::TcpStream,
     session: &Arc<Mutex<Option<ActiveSession>>>,
 ) -> Result<()> {
+    log::info!("handle_socks5: new connection");
     let mut buf = [0u8; 256];
     sock.read_exact(&mut buf[..2]).await?;
     let nmethods = buf[1] as usize;
@@ -346,18 +357,21 @@ async fn handle_socks5(
         id
     };
 
+    log::info!("socks5 target: {} stream_id={}", target, stream_id);
+
     let open_frame = Frame::new(MuxCommand::NewStream, stream_id, target.as_bytes().to_vec());
     {
         let mut w = sess.write.lock().await;
-        let mut sc = sess.server_cipher.lock().await;
+        let mut sc = sess.send_cipher.lock().await;
         write_frame_to(&mut *w, &mut *sc, &open_frame).await?;
     }
+    log::info!("socks5 NewStream sent, writing reply");
 
     let reply = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     sock.write_all(&reply).await?;
 
     let write = sess.write.clone();
-    let server_cipher = sess.server_cipher.clone();
+    let send_cipher = sess.send_cipher.clone();
     let streams_map = sess.streams.clone();
     let bytes_sent = sess.bytes_sent.clone();
     drop(sess_guard);
@@ -366,7 +380,7 @@ async fn handle_socks5(
     streams_map.lock().await.insert(stream_id, sock_w);
 
     let write_clone = write.clone();
-    let sc_clone = server_cipher.clone();
+    let sc_clone = send_cipher.clone();
     let bs_clone = bytes_sent.clone();
     let streams_clone = streams_map.clone();
 
