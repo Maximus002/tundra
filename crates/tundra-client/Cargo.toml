@@ -1,0 +1,24 @@
+[package]
+name = "tundra-client"
+description = "Tundra VPN client — local SOCKS5 proxy, connects to tundra-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tundra-client"
+path = "src/main.rs"
+
+[dependencies]
+tundra-core = { path = "../tundra-core" }
+tundra-fme = { path = "../tundra-fme" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+rand_chacha = "0.9"
+blake3 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"

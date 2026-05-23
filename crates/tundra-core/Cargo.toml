@@ -1,0 +1,19 @@
+[package]
+name = "tundra-core"
+description = "Core protocol types: framing, crypto, stream multiplexing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chacha20poly1305 = "0.10"
+blake3 = "1"
+pqc_kyber = { version = "0.7", features = ["kyber768", "std"] }
+rand_core = { version = "0.6", features = ["std"] }

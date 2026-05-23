@@ -1,0 +1,28 @@
+[package]
+name = "tundra-server"
+description = "Tundra VPN server — accepts morphed TLS connections, proxies to internet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tundra-server"
+path = "src/main.rs"
+
+[dependencies]
+tundra-core = { path = "../tundra-core" }
+tundra-fme = { path = "../tundra-fme" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+rand_chacha = "0.9"
+blake3 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rcgen = "0.13"
+toml = "0.8"

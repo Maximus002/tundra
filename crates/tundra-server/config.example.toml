@@ -1,0 +1,11 @@
+listen_addr = "0.0.0.0"
+listen_port = 8443
+target_domain = "www.microsoft.com"
+
+# Pre-shared key for client authentication (64 hex chars = 32 bytes)
+# Generate with: openssl rand -hex 32
+psk = "0000000000000000000000000000000000000000000000000000000000000000"
+
+max_connections = 1000
+max_per_ip = 10
+handshake_timeout_secs = 10

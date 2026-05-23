@@ -1,0 +1,41 @@
+[package]
+name = "tundra-fme"
+description = "Flow Morphing Engine — makes VPN traffic statistically indistinguishable from normal HTTPS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full", "sync"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rand = "0.9"
+rand_distr = "0.5"
+hdrhistogram = "7"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+
+[[bench]]
+name = "morphing"
+harness = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tundra-collect"
+path = "src/bin/collect.rs"
+
+[[bin]]
+name = "tundra-fme"
+path = "src/bin/fme.rs"
