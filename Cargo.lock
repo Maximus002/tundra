@@ -4683,6 +4683,7 @@ dependencies = [
  "blake3",
  "dirs",
  "hex",
+ "log",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rustls",

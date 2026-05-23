@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Result;
+use log;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -79,44 +80,57 @@ impl ProxyState {
     }
 
     pub async fn connect(&self, cfg: ProxyConfig) -> Result<()> {
+        log::info!("connect called: {}:{}", cfg.server_addr, cfg.server_port);
+
         let psk_bytes: [u8; 32] = hex::decode(&cfg.psk)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("PSK must be 32 bytes"))?;
 
         let addr = format!("{}:{}", cfg.server_addr, cfg.server_port);
+        log::info!("connecting TCP to {}", addr);
         let tcp = tokio::net::TcpStream::connect(&addr).await?;
+        log::info!("TCP connected, starting TLS");
         let tls_stream = tls_connect(tcp, &cfg.server_addr).await?;
+        log::info!("TLS connected");
 
         let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
 
         let kp = kem::generate_keypair()?;
         let kem_pk = kp.public_key;
+        log::info!("KEM keypair generated, pk len={}", kem_pk.len());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let mut auth_payload = vec![0u8; 8 + 32 + kem_pk.len()];
-        auth_payload[..8].copy_from_slice(&ts.to_be_bytes());
-        let mut mac = blake3::Hasher::new();
-        mac.update(&auth_payload[..8 + 32]);
-        mac.update(&psk_bytes);
-        let tag = mac.finalize();
-        auth_payload[8..40].copy_from_slice(tag.as_bytes());
-        auth_payload[40..].copy_from_slice(&kem_pk);
+
+        let mut auth_payload = Vec::with_capacity(8 + 32 + kem_pk.len());
+        auth_payload.extend_from_slice(&ts.to_le_bytes());
+
+        let mut hmac_msg = Vec::with_capacity(8 + kem_pk.len());
+        hmac_msg.extend_from_slice(&ts.to_le_bytes());
+        hmac_msg.extend_from_slice(&kem_pk);
+        let hmac = blake3::keyed_hash(&psk_bytes, &hmac_msg);
+        auth_payload.extend_from_slice(hmac.as_bytes());
+
+        auth_payload.extend_from_slice(&kem_pk);
 
         let auth_frame = Frame::new(MuxCommand::Auth, 0, auth_payload);
-        let encoded = auth_frame.encode();
-        let mut packet = (encoded.len() as u16).to_be_bytes().to_vec();
-        packet.extend_from_slice(&encoded);
-        tls_w.write_all(&packet).await?;
+        tls_w.write_all(&auth_frame.encode()).await?;
+        log::info!("auth frame sent, waiting for ack");
 
-        let mut len_buf = [0u8; 2];
-        tls_r.read_exact(&mut len_buf).await?;
-        let ack_len = u16::from_be_bytes(len_buf) as usize;
-        let mut ack_data = vec![0u8; ack_len];
-        tls_r.read_exact(&mut ack_data).await?;
+        let mut buf = vec![0u8; 4096];
+        let n = tls_r.read(&mut buf).await?;
+        log::info!("ack read {} bytes", n);
+        if n < 11 {
+            anyhow::bail!("no auth ack received");
+        }
 
-        let ack_frame = Frame::decode(&ack_data)?;
+        let ack_frame = Frame::decode(&buf[..n])?;
+        log::info!("ack decoded, cmd={:?}", ack_frame.header.command);
+        if ack_frame.header.command != MuxCommand::AuthAck {
+            anyhow::bail!("bad ack command: {:?}", ack_frame.header.command);
+        }
         let shared_secret = kem::decapsulate(&kp, &ack_frame.payload)?;
+        log::info!("KEM decapsulated");
 
         let client_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"server-enc");
@@ -142,10 +156,9 @@ impl ProxyState {
         };
 
         let socks_listener = TcpListener::bind(format!("127.0.0.1:{}", cfg.socks_port)).await?;
-        *self.socks_listener.lock().await = Some(socks_listener);
+        log::info!("SOCKS5 listening on 127.0.0.1:{}", cfg.socks_port);
 
         let session_arc = self.session.clone();
-        let socks_listener_arc = self.socks_listener.clone();
 
         self.start_reader_loop(
             tls_r,
@@ -155,30 +168,31 @@ impl ProxyState {
             cancel.clone(),
         );
 
+        let cancel_socks = cancel.clone();
         tokio::spawn(async move {
             loop {
-                let listener_guard = socks_listener_arc.lock().await;
-                let listener = match listener_guard.as_ref() {
-                    Some(l) => l,
-                    None => break,
-                };
-                let accept_result = listener.accept().await;
-                drop(listener_guard);
-
-                let (sock, _) = match accept_result {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                let session_ref = session_arc.clone();
-                tokio::spawn(async move {
-                    let _ = handle_socks5(sock, &session_ref).await;
-                });
+                tokio::select! {
+                    accept_result = socks_listener.accept() => {
+                        let (sock, _) = match accept_result {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let session_ref = session_arc.clone();
+                        tokio::spawn(async move {
+                            let _ = handle_socks5(sock, &session_ref).await;
+                        });
+                    }
+                    _ = cancel_socks.cancelled() => {
+                        log::info!("SOCKS listener cancelled");
+                        break;
+                    }
+                }
             }
         });
 
         *self.session.lock().await = Some(session);
         self.stats.lock().await.connected = true;
+        log::info!("connect completed successfully");
 
         Ok(())
     }
@@ -189,6 +203,7 @@ impl ProxyState {
         }
         *self.socks_listener.lock().await = None;
         self.stats.lock().await.connected = false;
+        log::info!("disconnected");
         Ok(())
     }
 
@@ -400,7 +415,13 @@ async fn tls_connect(
     tcp: tokio::net::TcpStream,
     domain: &str,
 ) -> Result<TlsStream> {
-    let config = rustls::ClientConfig::builder()
+    let provider = rustls::crypto::ring::default_provider();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[
+            &rustls::version::TLS13,
+            &rustls::version::TLS12,
+        ])
+        .expect("tls versions")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();

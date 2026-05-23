@@ -87,7 +87,9 @@ function startStatsPolling() {
       $("stat-sent").textContent = formatBytes(s.bytes_sent);
       $("stat-recv").textContent = formatBytes(s.bytes_recv);
       $("stat-uptime").textContent = formatUptime(s.uptime_secs);
-    } catch {}
+    } catch (e) {
+      console.error("stats error:", e);
+    }
   }, 1000);
 }
 
@@ -109,7 +111,9 @@ async function loadProfiles() {
       opt.textContent = p.name;
       sel.appendChild(opt);
     });
-  } catch {}
+  } catch (e) {
+    console.error("load profiles error:", e);
+  }
 }
 
 async function applyProfile(name) {
@@ -123,7 +127,9 @@ async function applyProfile(name) {
     $("socks-port").value = p.socks_port;
     $("psk").value = p.psk;
     $("fme-toggle").checked = p.fme;
-  } catch {}
+  } catch (e) {
+    console.error("apply profile error:", e);
+  }
 }
 
 $("btn-connect").addEventListener("click", async () => {
@@ -160,6 +166,7 @@ $("btn-connect").addEventListener("click", async () => {
   } catch (e) {
     setConnected(false);
     showToast("Connection failed: " + e, "error");
+    console.error("connect error:", e);
   }
   $("btn-connect").disabled = false;
 });
@@ -170,8 +177,11 @@ $("btn-save-profile").addEventListener("click", async () => {
     showToast("Fill server address first", "error");
     return;
   }
-  const name = prompt("Profile name:", cfg.name);
-  if (!name) return;
+  const name = $("profile-name-input").value.trim() || cfg.name;
+  if (!name) {
+    showToast("Enter profile name", "error");
+    return;
+  }
   cfg.name = name;
   try {
     await invoke("save_profile", { profile: cfg });
@@ -180,13 +190,16 @@ $("btn-save-profile").addEventListener("click", async () => {
     $("profile-select").value = name;
   } catch (e) {
     showToast("Save error: " + e, "error");
+    console.error("save error:", e);
   }
 });
 
 $("btn-delete-profile").addEventListener("click", async () => {
   const name = $("profile-select").value;
-  if (!name) return;
-  if (!confirm("Delete profile " + name + "?")) return;
+  if (!name) {
+    showToast("Select a profile first", "error");
+    return;
+  }
   try {
     await invoke("delete_profile", { name });
     showToast("Profile deleted", "info");
