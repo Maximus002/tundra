@@ -53,6 +53,7 @@ struct ActiveSession {
     bytes_recv: Arc<std::sync::atomic::AtomicU64>,
     connected_at: Arc<Mutex<Option<tokio::time::Instant>>>,
     cancel: tokio_util::sync::CancellationToken,
+    pending_acks: Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<()>>>>,
 }
 
 pub struct ProxyState {
@@ -190,6 +191,8 @@ impl ProxyState {
         let next_sid = Arc::new(Mutex::new(1u32));
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let bytes_recv = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pending_acks: Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let session = ActiveSession {
             write: Arc::new(tokio::sync::Mutex::new(tls_w)),
@@ -200,6 +203,7 @@ impl ProxyState {
             bytes_recv: bytes_recv.clone(),
             connected_at: Arc::new(Mutex::new(Some(tokio::time::Instant::now()))),
             cancel: cancel.clone(),
+            pending_acks: pending_acks.clone(),
         };
 
         let socks_listener = TcpListener::bind(format!("127.0.0.1:{}", cfg.socks_port)).await?;
@@ -213,6 +217,7 @@ impl ProxyState {
             streams.clone(),
             bytes_recv.clone(),
             cancel.clone(),
+            pending_acks.clone(),
         );
 
         let cancel_socks = cancel.clone();
@@ -296,6 +301,7 @@ impl ProxyState {
         streams: Arc<Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
         bytes_recv: Arc<std::sync::atomic::AtomicU64>,
         cancel: tokio_util::sync::CancellationToken,
+        pending_acks: Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<()>>>>,
     ) {
         tokio::spawn(async move {
             loop {
@@ -339,7 +345,11 @@ impl ProxyState {
                         streams.lock().await.remove(&frame.header.stream_id);
                     }
                     MuxCommand::NewStream => {
-                        log::info!("reader: NewStream ack sid={}", frame.header.stream_id);
+                        let sid = frame.header.stream_id;
+                        log::info!("reader: NewStream ack sid={}", sid);
+                        if let Some(tx) = pending_acks.lock().await.remove(&sid) {
+                            let _ = tx.send(());
+                        }
                     }
                     _ => {
                         log::info!("reader: frame cmd={:?} sid={}", frame.header.command, frame.header.stream_id);
@@ -407,21 +417,33 @@ async fn handle_socks5(
 
     log::info!("socks5 target: {} stream_id={}", target, stream_id);
 
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+    sess.pending_acks.lock().await.insert(stream_id, ack_tx);
+
     let open_frame = Frame::new(MuxCommand::NewStream, stream_id, target.as_bytes().to_vec());
     {
         let mut w = sess.write.lock().await;
         write_frame_to(&mut *w, &sess.send_cipher, &open_frame).await?;
     }
-    log::info!("socks5 NewStream sent, writing reply");
-
-    let reply = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-    sock.write_all(&reply).await?;
+    log::info!("socks5 NewStream sent, waiting for ack");
 
     let write = sess.write.clone();
     let send_cipher = sess.send_cipher.clone();
     let streams_map = sess.streams.clone();
     let bytes_sent = sess.bytes_sent.clone();
     drop(sess_guard);
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), ack_rx).await {
+        Ok(Ok(())) => {
+            let reply = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            sock.write_all(&reply).await?;
+        }
+        _ => {
+            let reply = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            let _ = sock.write_all(&reply).await;
+            anyhow::bail!("NewStream ack timeout or error for sid={}", stream_id);
+        }
+    }
 
     let (sock_r, sock_w) = sock.into_split();
     streams_map.lock().await.insert(stream_id, sock_w);
