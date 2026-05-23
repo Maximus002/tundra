@@ -17,6 +17,8 @@ pub struct ServerConfig {
     pub max_per_ip: usize,
     #[serde(default = "default_handshake_timeout")]
     pub handshake_timeout_secs: u64,
+    #[serde(default = "default_fme_profile")]
+    pub fme_profile: String,
 }
 
 fn default_listen_addr() -> String { "0.0.0.0".into() }
@@ -25,6 +27,7 @@ fn default_target_domain() -> String { "www.microsoft.com".into() }
 fn default_max_connections() -> usize { 1000 }
 fn default_max_per_ip() -> usize { 10 }
 fn default_handshake_timeout() -> u64 { 10 }
+fn default_fme_profile() -> String { "browser".into() }
 
 impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self> {

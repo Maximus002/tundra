@@ -5,7 +5,7 @@ use pqc_kyber::{
     decapsulate as kyber_decapsulate,
     KYBER_PUBLICKEYBYTES, KYBER_CIPHERTEXTBYTES, KYBER_SECRETKEYBYTES,
 };
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 pub const KEM_PK_SIZE: usize = KYBER_PUBLICKEYBYTES;

@@ -19,13 +19,9 @@ pub enum Direction {
     Downstream,
 }
 
-/// A histogram that can be sampled from and serialized compactly.
-/// Stores percentile boundaries instead of individual values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactHistogram {
-    /// Percentile boundaries: [p0, p5, p10, ..., p95, p99, p100]
     pub boundaries: Vec<u64>,
-    /// How many percentile points (uniform spacing, default 21 = every 5%)
     pub resolution: usize,
 }
 
@@ -53,7 +49,6 @@ impl CompactHistogram {
         Self { boundaries, resolution }
     }
 
-    /// Sample a value via linear interpolation between percentile boundaries.
     pub fn sample(&self, u: f64) -> u64 {
         debug_assert!((0.0..=1.0).contains(&u));
         let scaled = u * (self.boundaries.len() - 1) as f64;
@@ -79,7 +74,6 @@ impl CompactHistogram {
         if self.boundaries.len() < 2 {
             return self.boundaries[0] as f64;
         }
-        // Trapezoidal integration
         let n = self.boundaries.len() - 1;
         let mut sum = self.boundaries[0] as f64 + self.boundaries[n] as f64;
         for i in 1..n {
@@ -104,30 +98,165 @@ impl CompactHistogram {
     }
 }
 
-/// Statistical model of a site's traffic patterns, used for morphing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmmComponent {
+    pub mean: f64,
+    pub std_dev: f64,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SizeDistribution {
+    Histogram(CompactHistogram),
+    GMM { components: Vec<GmmComponent> },
+}
+
+impl SizeDistribution {
+    pub fn from_histogram(values: &[u64], resolution: usize) -> Self {
+        SizeDistribution::Histogram(CompactHistogram::new(values, resolution))
+    }
+
+    pub fn from_gmm(components: Vec<GmmComponent>) -> Self {
+        let total_weight: f64 = components.iter().map(|c| c.weight).sum();
+        assert!(total_weight > 0.0, "GMM weights must sum > 0");
+        SizeDistribution::GMM { components }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkovState {
+    pub mean_us: f64,
+    pub std_dev_us: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IatGenerator {
+    Histogram(CompactHistogram),
+    MarkovChain {
+        states: Vec<MarkovState>,
+        transition: Vec<Vec<f64>>,
+        #[serde(default)]
+        initial_state: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChaffContent {
+    RandomBytes,
+    HttpLikeHeaders,
+    DnsLikeQuery,
+    DummyTlsRecord,
+    Http2Frame,
+    RandomHighEntropy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChaffTypeWeight {
+    pub content: ChaffContent,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChaffConfig {
+    pub enabled: bool,
+    pub min_interval_us: u64,
+    pub max_interval_us: u64,
+    pub size_distribution: SizeDistribution,
+    pub content: ChaffContent,
+    #[serde(default)]
+    pub type_weights: Vec<ChaffTypeWeight>,
+}
+
+impl Default for ChaffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_interval_us: 800_000,
+            max_interval_us: 3_000_000,
+            size_distribution: SizeDistribution::from_histogram(&[64, 128, 256, 512], 21),
+            content: ChaffContent::RandomBytes,
+            type_weights: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ModelRotation {
+    Never,
+    PerSession,
+    Hourly,
+}
+
+impl Default for ModelRotation {
+    fn default() -> Self {
+        ModelRotation::Never
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdversarialConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jitter_pct")]
+    pub jitter_pct: f64,
+    #[serde(default = "default_size_noise_pct")]
+    pub size_noise_pct: f64,
+}
+
+fn default_jitter_pct() -> f64 { 0.10 }
+fn default_size_noise_pct() -> f64 { 0.05 }
+
+impl Default for AdversarialConfig {
+    fn default() -> Self {
+        Self { enabled: false, jitter_pct: default_jitter_pct(), size_noise_pct: default_size_noise_pct() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MorphProfile {
+    pub name: String,
+    pub overhead_budget: f64,
+    #[serde(default)]
+    pub chaff: ChaffConfig,
+    #[serde(default)]
+    pub rotation: ModelRotation,
+    #[serde(default)]
+    pub adversarial: AdversarialConfig,
+    #[serde(default)]
+    pub random_padding: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteModel {
     pub name: String,
-    pub upstream_sizes: CompactHistogram,
-    pub downstream_sizes: CompactHistogram,
-    pub iat_client: CompactHistogram,
-    pub iat_server: CompactHistogram,
+    pub upstream_sizes: SizeDistribution,
+    pub downstream_sizes: SizeDistribution,
+    pub iat_client: IatGenerator,
+    pub iat_server: IatGenerator,
     pub burst_pattern: Vec<BurstEntry>,
     pub init_window_client: u32,
     pub init_window_server: u32,
     pub keepalive_us: u64,
     pub overhead_budget: f64,
     pub granularity: MorphGranularity,
+    #[serde(default)]
+    pub chaff: ChaffConfig,
+    #[serde(default)]
+    pub adversarial: AdversarialConfig,
+    #[serde(default = "default_true")]
+    pub random_padding: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl SiteModel {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            upstream_sizes: CompactHistogram::new(&[1460], 21),
-            downstream_sizes: CompactHistogram::new(&[1460], 21),
-            iat_client: CompactHistogram::new(&[1000], 21),
-            iat_server: CompactHistogram::new(&[1000], 21),
+            upstream_sizes: SizeDistribution::from_histogram(&[1460], 21),
+            downstream_sizes: SizeDistribution::from_histogram(&[1460], 21),
+            iat_client: IatGenerator::Histogram(CompactHistogram::new(&[1000], 21)),
+            iat_server: IatGenerator::Histogram(CompactHistogram::new(&[1000], 21)),
             burst_pattern: vec![BurstEntry {
                 batch_size: 3,
                 pause_us: 50_000,
@@ -138,6 +267,9 @@ impl SiteModel {
             keepalive_us: 30_000_000,
             overhead_budget: 0.5,
             granularity: MorphGranularity::PerBurst,
+            chaff: ChaffConfig::default(),
+            adversarial: AdversarialConfig::default(),
+            random_padding: true,
         }
     }
 
@@ -150,21 +282,23 @@ impl SiteModel {
         let resolution = 41;
         Self {
             name,
-            upstream_sizes: CompactHistogram::new(&up_sizes, resolution),
-            downstream_sizes: CompactHistogram::new(&dn_sizes, resolution),
-            iat_client: CompactHistogram::new(&iat_c, resolution),
-            iat_server: CompactHistogram::new(&iat_s, resolution),
+            upstream_sizes: SizeDistribution::from_histogram(&up_sizes, resolution),
+            downstream_sizes: SizeDistribution::from_histogram(&dn_sizes, resolution),
+            iat_client: IatGenerator::Histogram(CompactHistogram::new(&iat_c, resolution)),
+            iat_server: IatGenerator::Histogram(CompactHistogram::new(&iat_s, resolution)),
             burst_pattern: m.burst_pattern.clone(),
             init_window_client: m.init_window_client,
             init_window_server: m.init_window_server,
             keepalive_us: m.keepalive_us,
             overhead_budget: 0.5,
             granularity: MorphGranularity::PerBurst,
+            chaff: ChaffConfig::default(),
+            adversarial: AdversarialConfig::default(),
+            random_padding: true,
         }
     }
 }
 
-/// Raw traffic measurements, collected by the traffic collector.
 #[derive(Debug, Clone, Default)]
 pub struct TrafficMeasurements {
     pub upstream_sizes: Vec<usize>,
@@ -198,4 +332,6 @@ pub struct MorphedPacket {
     pub real_data_len: usize,
     pub direction: Direction,
     pub send_after_us: u64,
+    #[serde(default)]
+    pub is_chaff: bool,
 }

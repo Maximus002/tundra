@@ -1,8 +1,7 @@
-use crate::model::{Direction, MorphGranularity, SiteModel};
+use crate::model::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Pre-built model library with generic traffic profiles.
 pub struct ModelLibrary {
     models: HashMap<String, SiteModel>,
 }
@@ -14,7 +13,6 @@ impl ModelLibrary {
         }
     }
 
-    /// Load all .bin model files from a directory.
     pub fn load_dir(dir: &Path) -> anyhow::Result<Self> {
         let mut lib = Self::new();
         if !dir.exists() {
@@ -40,14 +38,12 @@ impl ModelLibrary {
         self.models.get(name)
     }
 
-    /// Default model for generic HTTPS browsing.
     pub fn default_model(&self) -> Option<&SiteModel> {
         self.models.get("generic_browsing").or_else(|| {
             self.models.values().next()
         })
     }
 
-    /// Save a model to disk.
     pub fn save(model: &SiteModel, dir: &Path) -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.bin", model.name));
@@ -59,51 +55,74 @@ impl ModelLibrary {
     pub fn model_names(&self) -> Vec<&str> {
         self.models.keys().map(|s: &String| s.as_str()).collect()
     }
+
+    pub fn random_model(&self) -> Option<&SiteModel> {
+        if self.models.is_empty() {
+            return None;
+        }
+        let idx = (rand::random::<u64>() as usize) % self.models.len();
+        self.models.values().nth(idx)
+    }
+
+    pub fn load_builtin_models(&mut self) {
+        for model in crate::mimicry::all_mimicry_models() {
+            self.models.insert(model.name.clone(), model);
+        }
+        if !self.models.contains_key("generic_browsing") {
+            self.models.insert("generic_browsing".into(), synthetic_generic_browsing());
+        }
+    }
+
+    pub fn model_for_profile(&self, profile: &str) -> Option<&SiteModel> {
+        match profile {
+            "browser" => self.models.get("chrome_tls"),
+            "video" => self.models.get("video_streaming"),
+            "chat" => self.models.get("chat_messaging"),
+            "streaming" => self.models.get("http2_multiplexed"),
+            "paranoid" => self.models.get("paranoid"),
+            _ => self.default_model(),
+        }
+    }
 }
 
-/// Create a synthetic "generic HTTPS browsing" model from typical web traffic statistics.
-/// This is a fallback when no collected data is available.
 pub fn synthetic_generic_browsing() -> SiteModel {
-    use crate::model::{BurstEntry, CompactHistogram};
+    crate::mimicry::chrome_like_model()
+}
 
-    let up_sizes: Vec<u64> = vec![
-        200, 256, 300, 350, 400, 450,     // small requests
-        500, 512, 600, 700, 800, 900,     // medium requests
-        1000, 1100, 1200, 1300, 1400,     // large requests
-        1420, 1440, 1460, 1460, 1460, 1460, 1460, 1460, // full-MTU (weighted)
-    ];
-    let dn_sizes: Vec<u64> = vec![
-        200, 500, 1000, 1200, 1300, 1400, // mixed
-        1420, 1440, 1460, 1460, 1460, 1460, // full-MTU (HTML, images)
-        1460, 1460, 1460, 1460, 1460, 1460, 1460, 1460, 1460, // heavily weighted
-    ];
-    let iat_c: Vec<u64> = vec![
-        50, 100, 200,                       // burst
-        500, 1000, 2000,                    // intra-page
-        5000, 10000, 30000,                // inter-page
-    ];
-    let iat_s: Vec<u64> = vec![
-        20, 50, 100,                        // burst
-        200, 500, 1000,                     // response
-        2000, 5000,                         // thinking
-    ];
+pub fn model_from_profile(profile: &str) -> SiteModel {
+    let mut lib = ModelLibrary::new();
+    lib.load_builtin_models();
+    lib.model_for_profile(profile)
+        .cloned()
+        .unwrap_or_else(|| synthetic_generic_browsing())
+}
 
-    SiteModel {
-        name: "generic_browsing".into(),
-        upstream_sizes: CompactHistogram::new(&up_sizes, 41),
-        downstream_sizes: CompactHistogram::new(&dn_sizes, 41),
-        iat_client: CompactHistogram::new(&iat_c, 41),
-        iat_server: CompactHistogram::new(&iat_s, 41),
-        burst_pattern: vec![
-            BurstEntry { batch_size: 2, pause_us: 0, direction: Direction::Upstream },
-            BurstEntry { batch_size: 6, pause_us: 150_000, direction: Direction::Downstream },
-            BurstEntry { batch_size: 1, pause_us: 500_000, direction: Direction::Upstream },
-            BurstEntry { batch_size: 3, pause_us: 1_000_000, direction: Direction::Downstream },
-        ],
-        init_window_client: 29200,
-        init_window_server: 29200,
-        keepalive_us: 30_000_000,
-        overhead_budget: 0.5,
-        granularity: MorphGranularity::PerBurst,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_loads_builtins() {
+        let mut lib = ModelLibrary::new();
+        lib.load_builtin_models();
+        assert!(lib.model_names().len() >= 6);
+        assert!(lib.get("chrome_tls").is_some());
+        assert!(lib.get("paranoid").is_some());
+    }
+
+    #[test]
+    fn library_profile_lookup() {
+        let mut lib = ModelLibrary::new();
+        lib.load_builtin_models();
+        assert!(lib.model_for_profile("browser").is_some());
+        assert!(lib.model_for_profile("paranoid").is_some());
+    }
+
+    #[test]
+    fn library_random_model() {
+        let mut lib = ModelLibrary::new();
+        lib.load_builtin_models();
+        let m = lib.random_model();
+        assert!(m.is_some());
     }
 }

@@ -57,15 +57,7 @@ fn main() -> anyhow::Result<()> {
             let lib = library::ModelLibrary::load_dir(&dir)?;
             println!("Available models in {}:", dir.display());
             for name in lib.model_names() {
-                let m = lib.get(name).unwrap();
-                println!(
-                    "  {} (up: {} median, dn: {} median, iat_c: {}us median, iat_s: {}us median)",
-                    name,
-                    m.upstream_sizes.median(),
-                    m.downstream_sizes.median(),
-                    m.iat_client.median(),
-                    m.iat_server.median(),
-                );
+                    println!("  {}", name);
             }
         }
         Commands::Generate { dir } => {
@@ -92,12 +84,11 @@ fn bench_model(model_path: &PathBuf, payload_size: usize, iterations: usize) -> 
 
     for i in 0..iterations {
         let mut morpher = Morpher::new(model.clone());
-        let mut rng = rand::rng();
 
         let payload = vec![i as u8; payload_size];
         morpher.push(payload, Direction::Upstream);
 
-        let packets = morpher.morph_flush(&mut rng);
+        let packets = morpher.morph_flush();
         let overhead = morpher.stats().overhead_ratio();
 
         for pkt in &packets {
@@ -113,8 +104,12 @@ fn bench_model(model_path: &PathBuf, payload_size: usize, iterations: usize) -> 
     let avg_packets = total_packets as f64 / iterations as f64;
 
     // Build reference distributions from model for comparison
-    let ref_sizes: Vec<u64> = (0..5000).map(|i| model.upstream_sizes.sample(i as f64 / 4999.0)).collect();
-    let ref_iats: Vec<u64> = (0..5000).map(|i| model.iat_client.sample(i as f64 / 4999.0)).collect();
+    let ref_sizes: Vec<u64> = (0..5000).map(|_| tundra_fme::distribution::sample_size(&model.upstream_sizes, &mut rand::rng()) as u64).collect();
+    let ref_iats: Vec<u64> = {
+        let mut sampler = tundra_fme::distribution::IatSampler::from_generator(&model.iat_client);
+        let mut rng = rand::rng();
+        (0..5000).map(|_| sampler.next_iat(&mut rng)).collect()
+    };
 
     // Compute KS-like divergence
     let size_distance = wasserstein_distance(&size_values, &ref_sizes);

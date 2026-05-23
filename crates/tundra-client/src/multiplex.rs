@@ -8,8 +8,7 @@ use tokio::task::JoinHandle;
 use tundra_core::crypto::{self, Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{Frame, MuxCommand};
 use tundra_core::kem;
-use rand::SeedableRng;
-use tundra_fme::library::synthetic_generic_browsing;
+use tundra_fme::library::model_from_profile;
 use tundra_fme::model::{Direction, MorphedPacket};
 use tundra_fme::morpher::Morpher;
 use tracing::{debug, info};
@@ -26,8 +25,7 @@ struct MorpherWrapper {
 impl MorpherWrapper {
     fn push_and_flush(&mut self, data: Vec<u8>, direction: Direction) -> Vec<MorphedPacket> {
         self.morpher.push(data, direction);
-        let mut rng = rand_chacha::ChaCha12Rng::from_seed(rand::random());
-        self.morpher.morph_flush(&mut rng)
+        self.morpher.morph_flush()
     }
 }
 
@@ -57,6 +55,7 @@ pub struct SessionPool {
     max_session_age: Duration,
     max_session_bytes: u64,
     use_fme: bool,
+    fme_profile: String,
     upstream_tx: mpsc::Sender<StreamEvent>,
     upstream_rx: Option<mpsc::Receiver<StreamEvent>>,
 }
@@ -65,6 +64,7 @@ pub struct SessionPool {
 pub struct StreamEvent {
     pub stream_id: u32,
     pub data: Vec<u8>,
+    #[allow(dead_code)]
     pub is_close: bool,
 }
 
@@ -76,6 +76,7 @@ impl SessionPool {
         max_session_age: Duration,
         max_session_bytes: u64,
         use_fme: bool,
+        fme_profile: String,
     ) -> Self {
         let (upstream_tx, upstream_rx) = mpsc::channel(256);
         Self {
@@ -87,6 +88,7 @@ impl SessionPool {
             max_session_age,
             max_session_bytes,
             use_fme,
+            fme_profile,
             upstream_tx,
             upstream_rx: Some(upstream_rx),
         }
@@ -225,10 +227,10 @@ impl SessionPool {
             }
         });
 
-        let (pending_tx, fme_handle) = if self.use_fme {
-            let (ptx, prx) = mpsc::channel::<PendingWrite>(256);
-            let model = synthetic_generic_browsing();
-            let scheduler = Arc::new(Mutex::new(MorpherWrapper {
+            let (pending_tx, fme_handle) = if self.use_fme {
+                let (ptx, prx) = mpsc::channel::<PendingWrite>(256);
+                let model = model_from_profile(&self.fme_profile);
+                let scheduler = Arc::new(Mutex::new(MorpherWrapper {
                 morpher: tundra_fme::morpher::Morpher::new(model),
             }));
 

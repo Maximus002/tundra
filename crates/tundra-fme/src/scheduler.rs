@@ -44,8 +44,7 @@ impl MorphScheduler {
     /// Returns number of packets produced.
     pub async fn flush(&self) -> usize {
         let mut morpher = self.morpher.lock().await;
-        let mut rng = rand::rng();
-        let packets = morpher.morph_flush(&mut rng);
+        let packets = morpher.morph_flush();
 
         let count = packets.len();
         for pkt in packets {

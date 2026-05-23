@@ -30,6 +30,8 @@ struct Cli {
     max_session_bytes_mb: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fme: bool,
+    #[arg(long, default_value = "browser")]
+    fme_profile: String,
 }
 
 #[tokio::main]
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.max_session_age_secs),
         cli.max_session_bytes_mb * 1024 * 1024,
         cli.fme,
+        cli.fme_profile.clone(),
     );
 
     let upstream_rx = pool.take_upstream_rx()
@@ -73,8 +76,8 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(pool);
 
-    info!("SOCKS5 on {} -> {} (psk={}, fme={}, max_age={}s, max_bytes={}MB)",
-          socks_addr, server_addr, psk.is_some(), cli.fme,
+    info!("SOCKS5 on {} -> {} (psk={}, fme={}, profile={}, max_age={}s, max_bytes={}MB)",
+          socks_addr, server_addr, psk.is_some(), cli.fme, cli.fme_profile,
           cli.max_session_age_secs, cli.max_session_bytes_mb);
 
     let listener = TcpListener::bind(&socks_addr).await?;

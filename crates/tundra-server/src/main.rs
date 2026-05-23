@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::ServerConfig;
 use limiter::ConnectionLimiter;
-use rand::SeedableRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +17,7 @@ use tokio::time::{sleep, Duration};
 use tundra_core::crypto::{self, Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{MuxCommand, Frame};
 use tundra_core::kem;
-use tundra_fme::library::synthetic_generic_browsing;
+use tundra_fme::library::model_from_profile;
 use tundra_fme::model::Direction as FmeDirection;
 use tundra_fme::morpher::Morpher;
 use tracing::{error, info, warn};
@@ -48,7 +47,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let mut cfg = match &cli.config {
+    let mut srv_cfg = match &cli.config {
         Some(path) => ServerConfig::load(std::path::Path::new(path))?,
         None => ServerConfig::load(std::path::Path::new("tundra-server.toml")).unwrap_or_else(|_| {
             let default = ServerConfig {
@@ -59,25 +58,26 @@ async fn main() -> Result<()> {
                 max_connections: 1000,
                 max_per_ip: 10,
                 handshake_timeout_secs: 10,
+                fme_profile: "browser".into(),
             };
             warn!("no config file found, using defaults");
             default
         }),
     };
 
-    if let Some(v) = &cli.listen_addr { cfg.listen_addr = v.clone(); }
-    if let Some(v) = cli.listen_port { cfg.listen_port = v; }
-    if let Some(v) = &cli.target_domain { cfg.target_domain = v.clone(); }
+    if let Some(v) = &cli.listen_addr { srv_cfg.listen_addr = v.clone(); }
+    if let Some(v) = cli.listen_port { srv_cfg.listen_port = v; }
+    if let Some(v) = &cli.target_domain { srv_cfg.target_domain = v.clone(); }
 
-    let psk = cfg.psk_bytes()?;
+    let psk = srv_cfg.psk_bytes()?;
     if psk.is_none() {
         warn!("no PSK configured — any client can connect");
     }
 
-    let addr = format!("{}:{}", cfg.listen_addr, cfg.listen_port);
-    let tls_config = Arc::new(tls::TlsConfig::new(&cfg.target_domain)?);
-    let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections, cfg.max_per_ip));
-    let cfg = Arc::new(cfg);
+    let addr = format!("{}:{}", srv_cfg.listen_addr, srv_cfg.listen_port);
+    let tls_config = Arc::new(tls::TlsConfig::new(&srv_cfg.target_domain)?);
+    let limiter = Arc::new(ConnectionLimiter::new(srv_cfg.max_connections, srv_cfg.max_per_ip));
+    let cfg = Arc::new(srv_cfg);
     let psk = Arc::new(psk);
 
     info!("listening on {} (target={}, psk={})", addr, cfg.target_domain, psk.is_some());
@@ -142,7 +142,6 @@ const AUTH_TTL_SECS: u64 = 300;
 const CHALLENGE_SIZE: usize = 16;
 const AUTH_PAYLOAD_SIZE: usize = 8 + 32 + kem::HYBRID_PK_SIZE;
 const AUTH_ACK_SIZE: usize = kem::HYBRID_CT_SIZE;
-const KEY_CONFIRM_SIZE: usize = 32;
 
 fn verify_auth(
     frame: &Frame,
@@ -195,11 +194,11 @@ async fn handle_connection(
     tls_config: Arc<tls::TlsConfig>,
     target_domain: String,
     psk: Arc<Option<[u8; 32]>>,
-    cfg: Arc<ServerConfig>,
+    scfg: Arc<ServerConfig>,
 ) -> Result<()> {
     let acceptor = tls_config.acceptor();
     let tls_stream = tokio::time::timeout(
-        Duration::from_secs(cfg.handshake_timeout_secs),
+        Duration::from_secs(scfg.handshake_timeout_secs),
         acceptor.accept(socket),
     )
         .await
@@ -272,7 +271,7 @@ async fn handle_connection(
 
     info!("{} auth ok (hybrid KEM, key confirmed)", peer);
 
-    run_protocol(tls_read, tls_write, peer, client_cipher, server_cipher).await
+    run_protocol(tls_read, tls_write, peer, client_cipher, server_cipher, scfg).await
 }
 
 async fn run_protocol(
@@ -281,6 +280,7 @@ async fn run_protocol(
     peer: std::net::SocketAddr,
     client_cipher: Cipher,
     server_cipher: Arc<Cipher>,
+    scfg: Arc<ServerConfig>,
 ) -> Result<()> {
     let client_write = Arc::new(tokio::sync::Mutex::new(client_write));
     let streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
@@ -337,7 +337,8 @@ async fn run_protocol(
                         let cw = client_write.clone();
                         let st = streams.clone();
                         let sc = server_cipher.clone();
-                        upstream_tasks.spawn(relay_upstream(client_sid, cw, st, up_read, sc));
+                        let fp = scfg.fme_profile.clone();
+                        upstream_tasks.spawn(relay_upstream(client_sid, cw, st, up_read, sc, fp));
                     }
                     Err(e) => error!("{}:{} failed: {}", host, port, e),
                 }
@@ -376,8 +377,9 @@ async fn relay_upstream(
     streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
     mut upstream_read: tokio::net::tcp::OwnedReadHalf,
     server_cipher: Arc<Cipher>,
+    fme_profile: String,
 ) {
-    let model = synthetic_generic_browsing();
+    let model = model_from_profile(&fme_profile);
     let mut morpher = Morpher::new(model);
 
     loop {
@@ -389,8 +391,7 @@ async fn relay_upstream(
         };
 
         morpher.push(buf[..n].to_vec(), FmeDirection::Downstream);
-        let mut rng = rand_chacha::ChaCha12Rng::from_seed(rand::random());
-        let packets = morpher.morph_flush(&mut rng);
+        let packets = morpher.morph_flush();
 
         for (i, pkt) in packets.iter().enumerate() {
             if i > 0 && pkt.send_after_us > 0 {
