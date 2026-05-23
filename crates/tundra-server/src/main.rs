@@ -138,16 +138,24 @@ impl Drop for ConnectionGuard {
     }
 }
 
-const AUTH_TTL_SECS: u64 = 30;
+const AUTH_TTL_SECS: u64 = 300;
+const CHALLENGE_SIZE: usize = 16;
+const AUTH_PAYLOAD_SIZE: usize = 8 + 32 + kem::HYBRID_PK_SIZE;
+const AUTH_ACK_SIZE: usize = kem::HYBRID_CT_SIZE;
+const KEY_CONFIRM_SIZE: usize = 32;
 
-fn parse_auth(frame: &Frame, psk: &Option<[u8; 32]>) -> Result<[u8; kem::KEM_PK_SIZE]> {
+fn verify_auth(
+    frame: &Frame,
+    psk: &Option<[u8; 32]>,
+    server_nonce: &[u8; CHALLENGE_SIZE],
+) -> Result<([u8; kem::KEM_PK_SIZE], [u8; 32])> {
     if frame.header.command != MuxCommand::Auth {
         anyhow::bail!("expected Auth");
     }
-    let expected_len = 8 + 32 + kem::KEM_PK_SIZE;
-    if frame.payload.len() != expected_len {
-        anyhow::bail!("bad auth payload len: {} expected {}", frame.payload.len(), expected_len);
+    if frame.payload.len() < AUTH_PAYLOAD_SIZE {
+        anyhow::bail!("bad auth payload len: {} expected >= {}", frame.payload.len(), AUTH_PAYLOAD_SIZE);
     }
+
     let client_ts = u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -158,22 +166,27 @@ fn parse_auth(frame: &Frame, psk: &Option<[u8; 32]>) -> Result<[u8; kem::KEM_PK_
         anyhow::bail!("auth expired: ts={} now={} diff={}", client_ts, now, diff);
     }
 
-    let kem_pk = &frame.payload[40..40 + kem::KEM_PK_SIZE];
+    let kyber_pk: [u8; kem::KEM_PK_SIZE] = frame.payload[40..40 + kem::KEM_PK_SIZE]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad kyber pk"))?;
+    let x25519_pk: [u8; 32] = frame.payload[40 + kem::KEM_PK_SIZE..40 + kem::HYBRID_PK_SIZE]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad x25519 pk"))?;
 
     if let Some(psk_bytes) = psk {
-        let mut msg = Vec::with_capacity(8 + kem::KEM_PK_SIZE);
+        let mut msg = Vec::with_capacity(CHALLENGE_SIZE + 8 + kem::HYBRID_PK_SIZE);
+        msg.extend_from_slice(server_nonce);
         msg.extend_from_slice(&frame.payload[..8]);
-        msg.extend_from_slice(kem_pk);
+        msg.extend_from_slice(&kyber_pk);
+        msg.extend_from_slice(&x25519_pk);
         let expected_hmac = blake3::keyed_hash(psk_bytes, &msg);
         let received_hmac = &frame.payload[8..40];
-        if expected_hmac.as_bytes() != received_hmac {
+        if !crypto::constant_time_eq(expected_hmac.as_bytes(), received_hmac) {
             anyhow::bail!("auth HMAC mismatch");
         }
     }
 
-    let pk: [u8; kem::KEM_PK_SIZE] = kem_pk.try_into()
-        .map_err(|_| anyhow::anyhow!("bad pk size"))?;
-    Ok(pk)
+    Ok((kyber_pk, x25519_pk))
 }
 
 async fn handle_connection(
@@ -195,9 +208,15 @@ async fn handle_connection(
 
     info!("{} tls ok", peer);
 
-    let (mut tls_read, tls_write) = tokio::io::split(tls_stream);
+    let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
-    let mut tmp = vec![0u8; 4096];
+    let mut server_nonce = [0u8; CHALLENGE_SIZE];
+    use rand::RngCore;
+    rand::rng().fill_bytes(&mut server_nonce);
+    let challenge_frame = Frame::new_handshake(MuxCommand::Challenge, 0, server_nonce.to_vec());
+    tls_write.write_all(&challenge_frame.encode()).await?;
+
+    let mut tmp = vec![0u8; 8192];
     let n = match tls_read.read(&mut tmp).await {
         Ok(n) => n,
         Err(_) => return Ok(()),
@@ -211,24 +230,38 @@ async fn handle_connection(
     if magic != tundra_core::MAGIC {
         info!("{} non-tundra traffic -> fallback to target", peer);
         let initial_data = tmp[..n].to_vec();
+        let initial_data_with_challenge = [&challenge_frame.encode(), &initial_data[..]].concat();
         return fallback::fallback_to_target(tls_read, tls_write, &target_domain, initial_data).await;
     }
 
     let auth_frame = Frame::decode(&tmp[..n])?;
-    let kem_pk = parse_auth(&auth_frame, &psk)?;
+    let (kyber_pk, x25519_pk) = verify_auth(&auth_frame, &psk, &server_nonce)?;
 
-    let enc = kem::encapsulate(&kem_pk)
-        .map_err(|e| anyhow::anyhow!("KEM encapsulate failed: {:?}", e))?;
+    let enc = kem::hybrid_encapsulate(&kyber_pk, &x25519_pk)
+        .map_err(|e| anyhow::anyhow!("hybrid KEM encapsulate failed: {:?}", e))?;
 
     let server_enc_key = crypto::derive_key(&enc.shared_secret, b"server-enc");
     let client_enc_key = crypto::derive_key(&enc.shared_secret, b"client-enc");
     let server_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&server_enc_key)));
     let client_cipher = Cipher::new(&client_enc_key);
 
-    let ack = Frame::new(MuxCommand::AuthAck, 0, enc.ciphertext.to_vec());
-    let mut tls_write = tls_write;
+    let mut ack_payload = Vec::with_capacity(AUTH_ACK_SIZE);
+    ack_payload.extend_from_slice(&enc.kyber_ct);
+    ack_payload.extend_from_slice(&enc.x25519_ct);
+    let ack = Frame::new_handshake(MuxCommand::AuthAck, 0, ack_payload);
     tls_write.write_all(&ack.encode()).await?;
-    info!("{} auth ok", peer);
+
+    let mut sc = server_cipher.lock().await;
+    let kc_hash = blake3::keyed_hash(&server_enc_key, b"tundra-key-confirm-s2c");
+    let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
+    let encoded = kc_frame.encode();
+    let encrypted = sc.encrypt(&encoded)?;
+    let len = (encrypted.len() as u16).to_be_bytes();
+    tls_write.write_all(&len).await?;
+    tls_write.write_all(&encrypted).await?;
+    drop(sc);
+
+    info!("{} auth ok (hybrid KEM)", peer);
 
     run_protocol_tls(tls_read, tls_write, peer, client_cipher, server_cipher).await
 }

@@ -10,6 +10,8 @@ pub enum MuxCommand {
     Auth = 5,
     AuthAck = 6,
     Padding = 7,
+    Challenge = 8,
+    KeyConfirm = 9,
 }
 
 impl MuxCommand {
@@ -23,6 +25,8 @@ impl MuxCommand {
             5 => Some(Self::Auth),
             6 => Some(Self::AuthAck),
             7 => Some(Self::Padding),
+            8 => Some(Self::Challenge),
+            9 => Some(Self::KeyConfirm),
             _ => None,
         }
     }
@@ -73,6 +77,8 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+pub const HANDSHAKE_PAD_SIZE: usize = 1400;
+
 impl Frame {
     pub fn new(command: MuxCommand, stream_id: u32, payload: Vec<u8>) -> Self {
         assert!(payload.len() <= u16::MAX as usize, "frame payload too large");
@@ -81,6 +87,15 @@ impl Frame {
             header: MuxHeader { command, stream_id, length },
             payload,
         }
+    }
+
+    pub fn new_handshake(command: MuxCommand, stream_id: u32, payload: Vec<u8>) -> Self {
+        let target = HANDSHAKE_PAD_SIZE.saturating_sub(FRAME_WIRE_OVERHEAD);
+        let mut padded = payload;
+        if padded.len() < target {
+            padded.resize(target, 0);
+        }
+        Self::new(command, stream_id, padded)
     }
 
     pub fn new_padded(command: MuxCommand, stream_id: u32, data: Vec<u8>, total_payload_len: usize) -> Self {

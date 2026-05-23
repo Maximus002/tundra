@@ -104,46 +104,75 @@ impl SessionPool {
             .map_err(|e| anyhow::anyhow!("bad server name: {:?}", e))?;
         let tls_stream = connector.connect(server_name, tcp).await
             .context("TLS handshake")?;
-        let (mut read, w) = tokio::io::split(tls_stream);
+        let (mut read, mut w) = tokio::io::split(tls_stream);
 
-        let kp = kem::generate_keypair().context("KEM keypair")?;
+        let mut challenge_buf = vec![0u8; 4096];
+        let challenge_n = read.read(&mut challenge_buf).await?;
+        if challenge_n < 11 { anyhow::bail!("no challenge from server"); }
+        let challenge_frame = Frame::decode(&challenge_buf[..challenge_n])?;
+        if challenge_frame.header.command != MuxCommand::Challenge {
+            anyhow::bail!("expected Challenge, got {:?}", challenge_frame.header.command);
+        }
+        let server_nonce: [u8; 16] = challenge_frame.payload[..16].try_into()
+            .map_err(|_| anyhow::anyhow!("bad challenge nonce"))?;
+
+        let kp = kem::generate_hybrid_keypair().context("hybrid KEM keypair")?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let mut auth_payload = Vec::with_capacity(8 + 32 + kem::KEM_PK_SIZE);
+        let mut auth_payload = Vec::with_capacity(8 + 32 + kem::HYBRID_PK_SIZE);
         auth_payload.extend_from_slice(&ts.to_le_bytes());
         if let Some(psk_bytes) = self.psk {
-            let mut msg = Vec::with_capacity(8 + kem::KEM_PK_SIZE);
+            let mut msg = Vec::with_capacity(16 + 8 + kem::HYBRID_PK_SIZE);
+            msg.extend_from_slice(&server_nonce);
             msg.extend_from_slice(&ts.to_le_bytes());
-            msg.extend_from_slice(&kp.public_key);
+            msg.extend_from_slice(&kp.kyber_pk);
+            msg.extend_from_slice(&kp.x25519_pk);
             let hmac = blake3::keyed_hash(&psk_bytes, &msg);
             auth_payload.extend_from_slice(hmac.as_bytes());
         } else {
             auth_payload.extend_from_slice(&[0u8; 32]);
         }
-        auth_payload.extend_from_slice(&kp.public_key);
+        auth_payload.extend_from_slice(&kp.kyber_pk);
+        auth_payload.extend_from_slice(&kp.x25519_pk);
 
-        let auth_frame = Frame::new(MuxCommand::Auth, 0, auth_payload);
-        let mut w_raw = w;
-        w_raw.write_all(&auth_frame.encode()).await?;
-        let write: Arc<Mutex<BoxedWrite>> = Arc::new(Mutex::new(w_raw));
+        let auth_frame = Frame::new_handshake(MuxCommand::Auth, 0, auth_payload);
+        w.write_all(&auth_frame.encode()).await?;
 
-        let mut buf = vec![0u8; 2048];
-        let n = read.read(&mut buf).await?;
-        if n < 11 { anyhow::bail!("no auth ack"); }
-        let ack = Frame::decode(&buf[..n])?;
-        if ack.header.command != MuxCommand::AuthAck { anyhow::bail!("bad ack"); }
-        if ack.payload.len() != kem::KEM_CT_SIZE { anyhow::bail!("bad kem ct size"); }
+        let mut ack_buf = vec![0u8; 4096];
+        let ack_n = read.read(&mut ack_buf).await?;
+        if ack_n < 11 { anyhow::bail!("no auth ack"); }
+        let ack = Frame::decode(&ack_buf[..ack_n])?;
+        if ack.header.command != MuxCommand::AuthAck { anyhow::bail!("bad ack: {:?}", ack.header.command); }
+        if ack.payload.len() < kem::HYBRID_CT_SIZE {
+            anyhow::bail!("bad hybrid ct size: {}", ack.payload.len());
+        }
 
-        let shared_secret = kem::decapsulate(&kp, &ack.payload)
-            .context("KEM decapsulate")?;
+        let kyber_ct = &ack.payload[..kem::KEM_CT_SIZE];
+        let x25519_ct: [u8; 32] = ack.payload[kem::KEM_CT_SIZE..kem::HYBRID_CT_SIZE].try_into()
+            .map_err(|_| anyhow::anyhow!("bad x25519 ct"))?;
+
+        let shared_secret = kem::hybrid_decapsulate(&kp, kyber_ct, &x25519_ct)
+            .context("hybrid KEM decapsulate")?;
 
         let client_enc_key = crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = crypto::derive_key(&shared_secret, b"server-enc");
         let client_cipher = Arc::new(Mutex::new(Cipher::new(&client_enc_key)));
         let server_cipher = Cipher::new(&server_enc_key);
+
+        let kc_hash = blake3::keyed_hash(&client_enc_key, b"tundra-key-confirm-c2s");
+        let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
+        let mut cc = client_cipher.lock().await;
+        let kc_encoded = kc_frame.encode();
+        let kc_encrypted = cc.encrypt(&kc_encoded)?;
+        drop(cc);
+        let len = (kc_encrypted.len() as u16).to_be_bytes();
+        w.write_all(&len).await?;
+        w.write_all(&kc_encrypted).await?;
+
+        let write: Arc<Mutex<BoxedWrite>> = Arc::new(Mutex::new(w));
 
         let streams: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let streams_clone = streams.clone();

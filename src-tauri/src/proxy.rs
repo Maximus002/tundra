@@ -95,25 +95,41 @@ impl ProxyState {
 
         let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
 
-        let kp = kem::generate_keypair()?;
-        let kem_pk = kp.public_key;
-        log::info!("KEM keypair generated, pk len={}", kem_pk.len());
+        let mut challenge_buf = vec![0u8; 4096];
+        let challenge_n = tls_r.read(&mut challenge_buf).await?;
+        log::info!("challenge read {} bytes", challenge_n);
+        if challenge_n < 11 {
+            anyhow::bail!("no challenge from server");
+        }
+        let challenge_frame = Frame::decode(&challenge_buf[..challenge_n])?;
+        if challenge_frame.header.command != MuxCommand::Challenge {
+            anyhow::bail!("expected Challenge, got {:?}", challenge_frame.header.command);
+        }
+        let server_nonce: [u8; 16] = challenge_frame.payload[..16].try_into()
+            .map_err(|_| anyhow::anyhow!("bad challenge nonce"))?;
+        log::info!("server challenge received");
+
+        let kp = kem::generate_hybrid_keypair()?;
+        log::info!("hybrid KEM keypair generated");
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
 
-        let mut auth_payload = Vec::with_capacity(8 + 32 + kem_pk.len());
+        let mut auth_payload = Vec::with_capacity(8 + 32 + kem::HYBRID_PK_SIZE);
         auth_payload.extend_from_slice(&ts.to_le_bytes());
 
-        let mut hmac_msg = Vec::with_capacity(8 + kem_pk.len());
+        let mut hmac_msg = Vec::with_capacity(16 + 8 + kem::HYBRID_PK_SIZE);
+        hmac_msg.extend_from_slice(&server_nonce);
         hmac_msg.extend_from_slice(&ts.to_le_bytes());
-        hmac_msg.extend_from_slice(&kem_pk);
+        hmac_msg.extend_from_slice(&kp.kyber_pk);
+        hmac_msg.extend_from_slice(&kp.x25519_pk);
         let hmac = blake3::keyed_hash(&psk_bytes, &hmac_msg);
         auth_payload.extend_from_slice(hmac.as_bytes());
 
-        auth_payload.extend_from_slice(&kem_pk);
+        auth_payload.extend_from_slice(&kp.kyber_pk);
+        auth_payload.extend_from_slice(&kp.x25519_pk);
 
-        let auth_frame = Frame::new(MuxCommand::Auth, 0, auth_payload);
+        let auth_frame = Frame::new_handshake(MuxCommand::Auth, 0, auth_payload);
         tls_w.write_all(&auth_frame.encode()).await?;
         log::info!("auth frame sent, waiting for ack");
 
@@ -129,8 +145,14 @@ impl ProxyState {
         if ack_frame.header.command != MuxCommand::AuthAck {
             anyhow::bail!("bad ack command: {:?}", ack_frame.header.command);
         }
-        let shared_secret = kem::decapsulate(&kp, &ack_frame.payload)?;
-        log::info!("KEM decapsulated");
+        if ack_frame.payload.len() < kem::HYBRID_CT_SIZE {
+            anyhow::bail!("bad hybrid ct size: {}", ack_frame.payload.len());
+        }
+
+        let kyber_ct = &ack_frame.payload[..kem::KEM_CT_SIZE];
+        let x25519_ct: [u8; 32] = ack_frame.payload[kem::KEM_CT_SIZE..kem::HYBRID_CT_SIZE].try_into()?;
+        let shared_secret = kem::hybrid_decapsulate(&kp, kyber_ct, &x25519_ct)?;
+        log::info!("hybrid KEM decapsulated");
 
         let client_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"server-enc");
