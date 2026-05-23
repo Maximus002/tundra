@@ -18,7 +18,7 @@ fn is_private_ip(addr: IpAddr) -> bool {
             let octets = v4.octets();
             octets[0] == 127
                 || octets[0] == 10
-                || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
                 || (octets[0] == 192 && octets[1] == 168)
                 || (octets[0] == 169 && octets[1] == 254)
                 || octets[0] == 0

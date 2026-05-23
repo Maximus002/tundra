@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tundra_core::crypto::{self, Cipher};
+use tundra_core::crypto::{self, Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{Frame, MuxCommand};
 use tundra_core::kem;
 use rand::SeedableRng;
@@ -38,7 +38,7 @@ struct PendingWrite {
 
 pub struct ActiveSession {
     write: Arc<Mutex<BoxedWrite>>,
-    client_cipher: Arc<Mutex<Cipher>>,
+    client_cipher: Arc<Cipher>,
     reader_handle: JoinHandle<()>,
     fme_handle: Option<JoinHandle<()>>,
     created_at: Instant,
@@ -159,18 +159,32 @@ impl SessionPool {
 
         let client_enc_key = crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = crypto::derive_key(&shared_secret, b"server-enc");
-        let client_cipher = Arc::new(Mutex::new(Cipher::new(&client_enc_key)));
-        let server_cipher = Cipher::new(&server_enc_key);
+        let client_cipher = Arc::new(Cipher::new_with_role(&client_enc_key, ROLE_CLIENT));
+        let server_cipher = Cipher::new_with_role(&server_enc_key, ROLE_SERVER);
 
         let kc_hash = blake3::keyed_hash(&client_enc_key, b"tundra-key-confirm-c2s");
         let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
-        let mut cc = client_cipher.lock().await;
         let kc_encoded = kc_frame.encode();
-        let kc_encrypted = cc.encrypt(&kc_encoded)?;
-        drop(cc);
+        let kc_encrypted = client_cipher.encrypt(&kc_encoded)?;
         let len = (kc_encrypted.len() as u16).to_be_bytes();
         w.write_all(&len).await?;
         w.write_all(&kc_encrypted).await?;
+
+        let mut s2c_len_buf = [0u8; 2];
+        read.read_exact(&mut s2c_len_buf).await?;
+        let s2c_len = u16::from_be_bytes(s2c_len_buf) as usize;
+        if s2c_len == 0 { anyhow::bail!("empty server key confirm"); }
+        let mut s2c_blob = vec![0u8; s2c_len];
+        read.read_exact(&mut s2c_blob).await?;
+        let s2c_plain = server_cipher.decrypt(&s2c_blob)?;
+        let s2c_frame = Frame::decode(&s2c_plain)?;
+        if s2c_frame.header.command != MuxCommand::KeyConfirm {
+            anyhow::bail!("expected KeyConfirm from server, got {:?}", s2c_frame.header.command);
+        }
+        let expected_s2c = blake3::keyed_hash(&server_enc_key, b"tundra-key-confirm-s2c");
+        if !crypto::constant_time_eq(s2c_frame.payload.get(..32).unwrap_or(&[]), expected_s2c.as_bytes()) {
+            anyhow::bail!("server KeyConfirm mismatch");
+        }
 
         let write: Arc<Mutex<BoxedWrite>> = Arc::new(Mutex::new(w));
 
@@ -247,7 +261,7 @@ impl SessionPool {
         mut pending_rx: mpsc::Receiver<PendingWrite>,
         morpher: Arc<Mutex<MorpherWrapper>>,
         write: Arc<Mutex<BoxedWrite>>,
-        cipher: Arc<Mutex<Cipher>>,
+        cipher: Arc<Cipher>,
     ) {
         while let Some(pw) = pending_rx.recv().await {
             let packets = {
@@ -264,8 +278,7 @@ impl SessionPool {
                     MuxCommand::Data, pw.stream_id, real, pkt.data.len(),
                 );
                 let mut w = write.lock().await;
-                let mut cc = cipher.lock().await;
-                if Self::write_frame_inner(&mut *w, &mut *cc, &frame).await.is_err() {
+                if Self::write_frame_inner(&mut *w, &cipher, &frame).await.is_err() {
                     return;
                 }
             }
@@ -365,8 +378,7 @@ impl SessionPool {
         let open_frame = Frame::new(MuxCommand::NewStream, stream_id, target.as_bytes().to_vec());
         {
             let mut w = session.write.lock().await;
-            let mut cc = session.client_cipher.lock().await;
-            Self::write_frame_inner(&mut *w, &mut *cc, &open_frame).await?;
+            Self::write_frame_inner(&mut *w, &session.client_cipher, &open_frame).await?;
         }
 
         session.streams.lock().await.push(stream_id);
@@ -387,8 +399,7 @@ impl SessionPool {
             let frame = Frame::new_padded(MuxCommand::Data, stream_id, data, 0);
             {
                 let mut w = session.write.lock().await;
-                let mut cc = session.client_cipher.lock().await;
-                Self::write_frame_inner(&mut *w, &mut *cc, &frame).await?;
+                Self::write_frame_inner(&mut *w, &session.client_cipher, &frame).await?;
             }
             session.bytes_sent.fetch_add(
                 frame.encode().len() as u64,
@@ -402,8 +413,7 @@ impl SessionPool {
         let frame = Frame::new(MuxCommand::Close, stream_id, vec![]);
         {
             let mut w = session.write.lock().await;
-            let mut cc = session.client_cipher.lock().await;
-            Self::write_frame_inner(&mut *w, &mut *cc, &frame).await?;
+            Self::write_frame_inner(&mut *w, &session.client_cipher, &frame).await?;
         }
         session.streams.lock().await.retain(|&s| s != stream_id);
         debug!("closed stream {}", stream_id);
@@ -413,14 +423,13 @@ impl SessionPool {
     pub async fn send_ping(&self, session: &ActiveSession) -> Result<()> {
         let frame = Frame::new(MuxCommand::Ping, 0, vec![]);
         let mut w = session.write.lock().await;
-        let mut cc = session.client_cipher.lock().await;
-        Self::write_frame_inner(&mut *w, &mut *cc, &frame).await?;
+        Self::write_frame_inner(&mut *w, &session.client_cipher, &frame).await?;
         Ok(())
     }
 
     async fn write_frame_inner(
         writer: &mut (impl AsyncWriteExt + Unpin + ?Sized),
-        cipher: &mut Cipher,
+        cipher: &Cipher,
         frame: &Frame,
     ) -> Result<()> {
         let plaintext = frame.encode();
@@ -433,7 +442,7 @@ impl SessionPool {
 
     async fn read_frame_inner(
         reader: &mut (impl AsyncReadExt + Unpin),
-        cipher: &mut Cipher,
+        cipher: &Cipher,
     ) -> Result<Frame> {
         let mut len_buf = [0u8; 2];
         reader.read_exact(&mut len_buf).await?;

@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
-use tundra_core::crypto::{self, Cipher};
+use tundra_core::crypto::{self, Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{MuxCommand, Frame};
 use tundra_core::kem;
 use tundra_fme::library::synthetic_generic_browsing;
@@ -230,7 +230,6 @@ async fn handle_connection(
     if magic != tundra_core::MAGIC {
         info!("{} non-tundra traffic -> fallback to target", peer);
         let initial_data = tmp[..n].to_vec();
-        let initial_data_with_challenge = [&challenge_frame.encode(), &initial_data[..]].concat();
         return fallback::fallback_to_target(tls_read, tls_write, &target_domain, initial_data).await;
     }
 
@@ -242,8 +241,8 @@ async fn handle_connection(
 
     let server_enc_key = crypto::derive_key(&enc.shared_secret, b"server-enc");
     let client_enc_key = crypto::derive_key(&enc.shared_secret, b"client-enc");
-    let server_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&server_enc_key)));
-    let client_cipher = Cipher::new(&client_enc_key);
+    let server_cipher = Arc::new(Cipher::new_with_role(&server_enc_key, ROLE_SERVER));
+    let client_cipher = Cipher::new_with_role(&client_enc_key, ROLE_CLIENT);
 
     let mut ack_payload = Vec::with_capacity(AUTH_ACK_SIZE);
     ack_payload.extend_from_slice(&enc.kyber_ct);
@@ -251,117 +250,116 @@ async fn handle_connection(
     let ack = Frame::new_handshake(MuxCommand::AuthAck, 0, ack_payload);
     tls_write.write_all(&ack.encode()).await?;
 
-    let mut sc = server_cipher.lock().await;
     let kc_hash = blake3::keyed_hash(&server_enc_key, b"tundra-key-confirm-s2c");
     let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
-    let encoded = kc_frame.encode();
-    let encrypted = sc.encrypt(&encoded)?;
-    let len = (encrypted.len() as u16).to_be_bytes();
-    tls_write.write_all(&len).await?;
-    tls_write.write_all(&encrypted).await?;
-    drop(sc);
+    write_encrypted_frame(&mut tls_write, &server_cipher, &kc_frame).await?;
 
-    info!("{} auth ok (hybrid KEM)", peer);
+    let mut kc_len_buf = [0u8; 2];
+    tls_read.read_exact(&mut kc_len_buf).await?;
+    let kc_len = u16::from_be_bytes(kc_len_buf) as usize;
+    if kc_len == 0 { anyhow::bail!("empty key confirm"); }
+    let mut kc_blob = vec![0u8; kc_len];
+    tls_read.read_exact(&mut kc_blob).await?;
+    let kc_plain = client_cipher.decrypt(&kc_blob)?;
+    let kc_received = Frame::decode(&kc_plain)?;
+    if kc_received.header.command != MuxCommand::KeyConfirm {
+        anyhow::bail!("expected KeyConfirm from client, got {:?}", kc_received.header.command);
+    }
+    let expected_c2s = blake3::keyed_hash(&client_enc_key, b"tundra-key-confirm-c2s");
+    if !crypto::constant_time_eq(kc_received.payload.get(..32).unwrap_or(&[]), expected_c2s.as_bytes()) {
+        anyhow::bail!("client KeyConfirm mismatch");
+    }
 
-    run_protocol_tls(tls_read, tls_write, peer, client_cipher, server_cipher).await
+    info!("{} auth ok (hybrid KEM, key confirmed)", peer);
+
+    run_protocol(tls_read, tls_write, peer, client_cipher, server_cipher).await
 }
 
-macro_rules! run_protocol_body {
-    ($client_read:expr, $client_write:expr, $peer:expr, $client_cipher:expr, $server_cipher:expr) => {{
-        let client_write = Arc::new(tokio::sync::Mutex::new($client_write));
-        let streams: Arc<tokio::sync::Mutex<std::collections::HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut client_read = $client_read;
-        let mut client_cipher = $client_cipher;
-        let mut upstream_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-        loop {
-            let mut len_buf = [0u8; 2];
-            client_read.read_exact(&mut len_buf).await?;
-            let len = u16::from_be_bytes(len_buf) as usize;
-            if len == 0 { break; }
-            let mut blob = vec![0u8; len];
-            client_read.read_exact(&mut blob).await?;
-
-            let plaintext = client_cipher.decrypt(&blob)?;
-            let frame = Frame::decode(&plaintext)?;
-
-            match frame.header.command {
-                MuxCommand::Data => {
-                    let mut streams = streams.lock().await;
-                    if let Some(w) = streams.get_mut(&frame.header.stream_id) {
-                        let data = frame.real_data();
-                        if !data.is_empty() {
-                            w.write_all(data).await?;
-                        }
-                    }
-                }
-                MuxCommand::NewStream => {
-                    let client_sid = frame.header.stream_id;
-                    let target = String::from_utf8_lossy(&frame.payload);
-                    let parts: Vec<&str> = target.splitn(2, ':').collect();
-                    let host = parts[0];
-                    let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(80);
-
-                    if !acl::is_upstream_allowed(host, port) {
-                        error!("{}:{} blocked by ACL", host, port);
-                        let resp = Frame::new(MuxCommand::Close, client_sid, vec![]);
-                        let mut sc = $server_cipher.lock().await;
-                        let mut cw = client_write.lock().await;
-                        write_frame(&mut *cw, &mut *sc, &resp).await?;
-                        continue;
-                    }
-
-                    match TcpStream::connect(format!("{}:{}", host, port)).await {
-                        Ok(upstream) => {
-                            let (up_read, up_write) = upstream.into_split();
-                            streams.lock().await.insert(client_sid, up_write);
-
-                            let resp = Frame::new(MuxCommand::NewStream, client_sid, vec![]);
-                            {
-                                let mut sc = $server_cipher.lock().await;
-                                let mut cw = client_write.lock().await;
-                                write_frame(&mut *cw, &mut *sc, &resp).await?;
-                            }
-
-                            let cw = client_write.clone();
-                            let st = streams.clone();
-                            let sc = $server_cipher.clone();
-                            upstream_tasks.spawn(relay_upstream(client_sid, cw, st, up_read, sc));
-                        }
-                        Err(e) => error!("{}:{} failed: {}", host, port, e),
-                    }
-                }
-                MuxCommand::Close => { streams.lock().await.remove(&frame.header.stream_id); }
-                MuxCommand::Ping => {
-                    let pong = Frame::new(MuxCommand::Pong, 0, vec![]);
-                    let mut sc = $server_cipher.lock().await;
-                    let mut cw = client_write.lock().await;
-                    write_frame(&mut *cw, &mut *sc, &pong).await?;
-                }
-                _ => {}
-            }
-        }
-        drop(streams);
-        upstream_tasks.abort_all();
-        info!("{} disconnected", $peer);
-        Ok(())
-    }};
-}
-
-async fn run_protocol_tls(
-    client_read: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+async fn run_protocol(
+    mut client_read: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
     client_write: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
     peer: std::net::SocketAddr,
     client_cipher: Cipher,
-    server_cipher: Arc<tokio::sync::Mutex<Cipher>>,
+    server_cipher: Arc<Cipher>,
 ) -> Result<()> {
-    run_protocol_body!(client_read, client_write, peer, client_cipher, server_cipher)
+    let client_write = Arc::new(tokio::sync::Mutex::new(client_write));
+    let streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut upstream_tasks: JoinSet<()> = JoinSet::new();
+
+    loop {
+        let mut len_buf = [0u8; 2];
+        client_read.read_exact(&mut len_buf).await?;
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 { break; }
+        let mut blob = vec![0u8; len];
+        client_read.read_exact(&mut blob).await?;
+
+        let plaintext = client_cipher.decrypt(&blob)?;
+        let frame = Frame::decode(&plaintext)?;
+
+        match frame.header.command {
+            MuxCommand::Data => {
+                let mut streams = streams.lock().await;
+                if let Some(w) = streams.get_mut(&frame.header.stream_id) {
+                    let data = frame.real_data();
+                    if !data.is_empty() {
+                        w.write_all(data).await?;
+                    }
+                }
+            }
+            MuxCommand::NewStream => {
+                let client_sid = frame.header.stream_id;
+                let target = String::from_utf8_lossy(&frame.payload);
+                let parts: Vec<&str> = target.splitn(2, ':').collect();
+                let host = parts[0];
+                let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(80);
+
+                if !acl::is_upstream_allowed(host, port) {
+                    error!("{}:{} blocked by ACL", host, port);
+                    let resp = Frame::new(MuxCommand::Close, client_sid, vec![]);
+                    let mut cw = client_write.lock().await;
+                    write_encrypted_frame(&mut *cw, &server_cipher, &resp).await?;
+                    continue;
+                }
+
+                match TcpStream::connect(format!("{}:{}", host, port)).await {
+                    Ok(upstream) => {
+                        let (up_read, up_write) = upstream.into_split();
+                        streams.lock().await.insert(client_sid, up_write);
+
+                        let resp = Frame::new(MuxCommand::NewStream, client_sid, vec![]);
+                        {
+                            let mut cw = client_write.lock().await;
+                            write_encrypted_frame(&mut *cw, &server_cipher, &resp).await?;
+                        }
+
+                        let cw = client_write.clone();
+                        let st = streams.clone();
+                        let sc = server_cipher.clone();
+                        upstream_tasks.spawn(relay_upstream(client_sid, cw, st, up_read, sc));
+                    }
+                    Err(e) => error!("{}:{} failed: {}", host, port, e),
+                }
+            }
+            MuxCommand::Close => { streams.lock().await.remove(&frame.header.stream_id); }
+            MuxCommand::Ping => {
+                let pong = Frame::new(MuxCommand::Pong, 0, vec![]);
+                let mut cw = client_write.lock().await;
+                write_encrypted_frame(&mut *cw, &server_cipher, &pong).await?;
+            }
+            _ => {}
+        }
+    }
+    drop(streams);
+    upstream_tasks.abort_all();
+    info!("{} disconnected", peer);
+    Ok(())
 }
 
-async fn write_frame(
+async fn write_encrypted_frame(
     writer: &mut (impl AsyncWriteExt + Unpin),
-    cipher: &mut Cipher,
+    cipher: &Cipher,
     frame: &Frame,
 ) -> Result<()> {
     let plaintext = frame.encode();
@@ -372,12 +370,12 @@ async fn write_frame(
     Ok(())
 }
 
-async fn relay_upstream<W: AsyncWriteExt + Unpin + Send + 'static>(
+async fn relay_upstream(
     stream_id: u32,
-    client_write: Arc<tokio::sync::Mutex<W>>,
+    client_write: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>,
     streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
     mut upstream_read: tokio::net::tcp::OwnedReadHalf,
-    server_cipher: Arc<tokio::sync::Mutex<Cipher>>,
+    server_cipher: Arc<Cipher>,
 ) {
     let model = synthetic_generic_browsing();
     let mut morpher = Morpher::new(model);
@@ -400,16 +398,14 @@ async fn relay_upstream<W: AsyncWriteExt + Unpin + Send + 'static>(
             }
             let real = pkt.data[..pkt.real_data_len].to_vec();
             let frame = Frame::new_padded(MuxCommand::Data, stream_id, real, pkt.data.len());
-            let mut sc = server_cipher.lock().await;
             let mut cw = client_write.lock().await;
-            if write_frame(&mut *cw, &mut *sc, &frame).await.is_err() {
+            if write_encrypted_frame(&mut *cw, &server_cipher, &frame).await.is_err() {
                 return;
             }
         }
     }
     let frame = Frame::new(MuxCommand::Close, stream_id, vec![]);
-    let mut sc = server_cipher.lock().await;
     let mut cw = client_write.lock().await;
-    let _ = write_frame(&mut *cw, &mut *sc, &frame).await;
+    let _ = write_encrypted_frame(&mut *cw, &server_cipher, &frame).await;
     streams.lock().await.remove(&stream_id);
 }

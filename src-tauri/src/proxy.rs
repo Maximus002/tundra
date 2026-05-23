@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tundra_core::crypto::Cipher;
+use tundra_core::crypto::{Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{Frame, MuxCommand};
 use tundra_core::kem;
 
@@ -46,7 +46,7 @@ pub struct ProxyStats {
 
 struct ActiveSession {
     write: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TlsStream>>>,
-    send_cipher: Arc<tokio::sync::Mutex<Cipher>>,
+    send_cipher: Arc<Cipher>,
     streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
     next_sid: Arc<tokio::sync::Mutex<u32>>,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
@@ -157,8 +157,33 @@ impl ProxyState {
         let client_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"client-enc");
         let server_enc_key = tundra_core::crypto::derive_key(&shared_secret, b"server-enc");
 
-        let send_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&client_enc_key)));
-        let recv_cipher = Arc::new(tokio::sync::Mutex::new(Cipher::new(&server_enc_key)));
+        let send_cipher = Arc::new(Cipher::new_with_role(&client_enc_key, ROLE_CLIENT));
+        let recv_cipher = Arc::new(Cipher::new_with_role(&server_enc_key, ROLE_SERVER));
+
+        let kc_hash = blake3::keyed_hash(&client_enc_key, b"tundra-key-confirm-c2s");
+        let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
+        let kc_encrypted = send_cipher.encrypt(&kc_frame.encode())?;
+        let kc_len = (kc_encrypted.len() as u16).to_be_bytes();
+        tls_w.write_all(&kc_len).await?;
+        tls_w.write_all(&kc_encrypted).await?;
+
+        let mut s2c_len_buf = [0u8; 2];
+        tls_r.read_exact(&mut s2c_len_buf).await?;
+        let s2c_len = u16::from_be_bytes(s2c_len_buf) as usize;
+        if s2c_len == 0 { anyhow::bail!("empty server key confirm"); }
+        let mut s2c_blob = vec![0u8; s2c_len];
+        tls_r.read_exact(&mut s2c_blob).await?;
+        let s2c_plain = recv_cipher.decrypt(&s2c_blob)?;
+        let s2c_frame = Frame::decode(&s2c_plain)?;
+        if s2c_frame.header.command != MuxCommand::KeyConfirm {
+            anyhow::bail!("expected KeyConfirm from server, got {:?}", s2c_frame.header.command);
+        }
+        let expected_s2c = blake3::keyed_hash(&server_enc_key, b"tundra-key-confirm-s2c");
+        if !tundra_core::crypto::constant_time_eq(s2c_frame.payload.get(..32).unwrap_or(&[]), expected_s2c.as_bytes()) {
+            anyhow::bail!("server KeyConfirm mismatch");
+        }
+        log::info!("key confirmation verified");
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let streams: Arc<Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -267,7 +292,7 @@ impl ProxyState {
     fn start_reader_loop(
         &self,
         mut tls_read: tokio::io::ReadHalf<TlsStream>,
-        client_cipher: Arc<Mutex<Cipher>>,
+        client_cipher: Arc<Cipher>,
         streams: Arc<Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
         bytes_recv: Arc<std::sync::atomic::AtomicU64>,
         cancel: tokio_util::sync::CancellationToken,
@@ -286,12 +311,10 @@ impl ProxyState {
                 let mut blob = vec![0u8; len];
                 if tls_read.read_exact(&mut blob).await.is_err() { break; }
 
-                let mut cipher = client_cipher.lock().await;
-                let plaintext = match cipher.decrypt(&blob) {
+                let plaintext = match client_cipher.decrypt(&blob) {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                drop(cipher);
 
                 let frame = match Frame::decode(&plaintext) {
                     Ok(f) => f,
@@ -374,8 +397,11 @@ async fn handle_socks5(
 
     let stream_id = {
         let mut sid = sess.next_sid.lock().await;
+        if *sid >= tundra_core::MAX_STREAMS as u32 {
+            anyhow::bail!("stream id exhausted");
+        }
         let id = *sid;
-        *sid = (*sid + 1) % (tundra_core::MAX_STREAMS as u32);
+        *sid += 1;
         id
     };
 
@@ -384,8 +410,7 @@ async fn handle_socks5(
     let open_frame = Frame::new(MuxCommand::NewStream, stream_id, target.as_bytes().to_vec());
     {
         let mut w = sess.write.lock().await;
-        let mut sc = sess.send_cipher.lock().await;
-        write_frame_to(&mut *w, &mut *sc, &open_frame).await?;
+        write_frame_to(&mut *w, &sess.send_cipher, &open_frame).await?;
     }
     log::info!("socks5 NewStream sent, writing reply");
 
@@ -416,8 +441,7 @@ async fn handle_socks5(
                     let data = Frame::new_padded(MuxCommand::Data, stream_id, buf[..n].to_vec(), 0);
                     bs_clone.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     let mut w = write_clone.lock().await;
-                    let mut sc = sc_clone.lock().await;
-                    if write_frame_to(&mut *w, &mut *sc, &data).await.is_err() {
+                    if write_frame_to(&mut *w, &sc_clone, &data).await.is_err() {
                         break;
                     }
                 }
@@ -427,8 +451,7 @@ async fn handle_socks5(
         streams_clone.lock().await.remove(&stream_id);
         let close = Frame::new(MuxCommand::Close, stream_id, vec![]);
         let mut w = write_clone.lock().await;
-        let mut sc = sc_clone.lock().await;
-        let _ = write_frame_to(&mut *w, &mut *sc, &close).await;
+        let _ = write_frame_to(&mut *w, &sc_clone, &close).await;
     });
 
     Ok(())
@@ -436,7 +459,7 @@ async fn handle_socks5(
 
 async fn write_frame_to(
     writer: &mut tokio::io::WriteHalf<TlsStream>,
-    cipher: &mut Cipher,
+    cipher: &Cipher,
     frame: &Frame,
 ) -> Result<()> {
     let plaintext = frame.encode();

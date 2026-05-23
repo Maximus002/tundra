@@ -51,12 +51,11 @@ impl ConnectionLimiter {
         Ok(())
     }
 
-    pub fn release(&self, ip: IpAddr) {
-        self.global_count.fetch_sub(1, Ordering::Relaxed);
-        if let Ok(mut per_ip) = self.per_ip.try_lock() {
-            if let Some(entry) = per_ip.get_mut(&ip) {
-                entry.count = entry.count.saturating_sub(1);
-            }
+    pub async fn release(&self, ip: IpAddr) {
+        let mut per_ip = self.per_ip.lock().await;
+        if let Some(entry) = per_ip.get_mut(&ip) {
+            entry.count = entry.count.saturating_sub(1);
         }
+        self.global_count.fetch_sub(1, Ordering::Relaxed);
     }
 }

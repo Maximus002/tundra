@@ -6,23 +6,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const NONCE_SIZE: usize = 12;
 
+pub const ROLE_CLIENT: u8 = 0x01;
+pub const ROLE_SERVER: u8 = 0x02;
+
 pub struct Cipher {
     cipher: ChaCha20Poly1305,
     counter: AtomicU64,
+    role: u8,
 }
 
 impl Cipher {
-    pub fn new(key: &[u8; 32]) -> Self {
+    pub fn new_with_role(key: &[u8; 32], role: u8) -> Self {
         let cipher = ChaCha20Poly1305::new(key.into());
         Self {
             cipher,
             counter: AtomicU64::new(0),
+            role,
         }
     }
 
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self::new_with_role(key, 0)
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
-        let nonce = counter_to_nonce(ctr);
+        let nonce = counter_to_nonce(ctr, self.role);
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext)
@@ -33,7 +42,7 @@ impl Cipher {
         Ok(output)
     }
 
-    pub fn decrypt(&mut self, blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn decrypt(&self, blob: &[u8]) -> anyhow::Result<Vec<u8>> {
         if blob.len() < NONCE_SIZE + 16 {
             anyhow::bail!("ciphertext too short");
         }
@@ -49,10 +58,11 @@ impl Cipher {
     }
 }
 
-fn counter_to_nonce(ctr: u64) -> Nonce {
+fn counter_to_nonce(ctr: u64, role: u8) -> Nonce {
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     nonce_bytes[..8].copy_from_slice(&ctr.to_be_bytes());
-    nonce_bytes[8..].copy_from_slice(&[0u8; 4]);
+    nonce_bytes[8..11].copy_from_slice(&[0u8; 3]);
+    nonce_bytes[11] = role;
     *Nonce::from_slice(&nonce_bytes)
 }
 
@@ -86,8 +96,8 @@ mod tests {
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let key = generate_key();
-        let mut enc = Cipher::new(&key);
-        let mut dec = Cipher::new(&key);
+        let enc = Cipher::new(&key);
+        let dec = Cipher::new(&key);
 
         let plaintext = b"hello, tundra!";
         let ciphertext = enc.encrypt(plaintext).unwrap();
@@ -101,7 +111,7 @@ mod tests {
     #[test]
     fn encrypt_produces_unique_ciphertexts() {
         let key = generate_key();
-        let mut enc = Cipher::new(&key);
+        let enc = Cipher::new(&key);
         let ct1 = enc.encrypt(b"same data").unwrap();
         let ct2 = enc.encrypt(b"same data").unwrap();
         assert_ne!(ct1, ct2, "counter nonce must produce different ciphertexts");
@@ -119,7 +129,7 @@ mod tests {
     #[test]
     fn counter_increments() {
         let key = generate_key();
-        let mut cipher = Cipher::new(&key);
+        let cipher = Cipher::new(&key);
         assert_eq!(cipher.encrypt_count(), 0);
         cipher.encrypt(b"a").unwrap();
         assert_eq!(cipher.encrypt_count(), 1);
