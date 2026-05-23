@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tundra</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Tundra</h1>
+      <span id="status-badge" class="badge disconnected">Disconnected</span>
+    </header>
+
+    <section id="connection-panel">
+      <div class="field">
+        <label>Profile</label>
+        <div class="row">
+          <select id="profile-select">
+            <option value="">-- Select profile --</option>
+          </select>
+          <button id="btn-save-profile" class="btn-small" title="Save profile">Save</button>
+          <button id="btn-delete-profile" class="btn-small btn-danger" title="Delete profile">Del</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Server Address</label>
+        <input type="text" id="server-addr" placeholder="1.2.3.4" />
+      </div>
+
+      <div class="field">
+        <label>Server Port</label>
+        <input type="number" id="server-port" value="8443" min="1" max="65535" />
+      </div>
+
+      <div class="field">
+        <label>SOCKS Port</label>
+        <input type="number" id="socks-port" value="1080" min="1" max="65535" />
+      </div>
+
+      <div class="field">
+        <label>PSK (hex)</label>
+        <input type="password" id="psk" placeholder="64 hex characters" />
+      </div>
+
+      <div class="field">
+        <label class="toggle-label">
+          <input type="checkbox" id="fme-toggle" checked />
+          <span>Flow Morphing</span>
+        </label>
+      </div>
+
+      <button id="btn-connect" class="btn-connect">Connect</button>
+    </section>
+
+    <section id="stats-panel">
+      <h2>Statistics</h2>
+      <div class="stats-grid">
+        <div class="stat">
+          <span class="stat-value" id="stat-streams">0</span>
+          <span class="stat-label">Streams</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-sent">0 B</span>
+          <span class="stat-label">Sent</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-recv">0 B</span>
+          <span class="stat-label">Received</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-uptime">0:00</span>
+          <span class="stat-label">Uptime</span>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span class="footer-text">Tundra v0.1.0</span>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  tundra-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tundra-server
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./tundra-server.toml:/etc/tundra/tundra-server.toml:ro
+    healthcheck:
+      test: ["CMD", "ss", "-tlnp"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
