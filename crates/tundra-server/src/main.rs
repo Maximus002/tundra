@@ -348,7 +348,7 @@ async fn handle_quic_connection(
     scfg: Arc<ServerConfig>,
 ) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await
-        .with_context(|| format!("QUIC accept_bi failed for {}", peer))?;
+        .with_context(|| format!("QUIC accept_bi failed for {}: {:?}", peer, conn.close_reason()))?;
 
     info!("{} QUIC bi-stream opened", peer);
 
