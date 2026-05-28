@@ -352,7 +352,10 @@ async fn handle_quic_connection(
     psk: Arc<Option<[u8; 32]>>,
     scfg: Arc<ServerConfig>,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn.accept_bi().await
+    info!("{} QUIC handler waiting for bi-stream...", peer);
+    let (mut send, mut recv) = tokio::time::timeout(std::time::Duration::from_secs(15), conn.accept_bi())
+        .await
+        .context("QUIC accept_bi timeout for {peer}")?
         .with_context(|| format!("QUIC accept_bi failed for {}: {:?}", peer, conn.close_reason()))?;
 
     info!("{} QUIC bi-stream opened", peer);
