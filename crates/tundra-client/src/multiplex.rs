@@ -141,7 +141,7 @@ impl SessionPool {
             let addr = self.server_addr.parse::<std::net::SocketAddr>()
                 .context("invalid server address for QUIC")?;
             let server_name = "tundra-server";
-            let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
+            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
                 .context("QUIC client endpoint")?;
             endpoint.set_default_client_config(qcfg);
 

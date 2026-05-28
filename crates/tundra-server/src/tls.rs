@@ -22,10 +22,11 @@ impl TlsConfig {
         let cert_der = CertificateDer::from(cert);
         let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
-        let server_config = rustls::ServerConfig::builder()
+        let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| anyhow::anyhow!("tls config: {}", e))?;
+        server_config.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let rustls_config = Arc::new(server_config);
         let acceptor = TlsAcceptor::from(rustls_config.clone());
