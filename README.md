@@ -116,7 +116,9 @@ curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `listen` | `0.0.0.0:8443` | Listen address:port (parsed as `addr` + `port` if separate) |
+| `listen` | `0.0.0.0:8443` | Listen address:port (convenience; overrides `listen_addr`/`listen_port`) |
+| `listen_addr` | `0.0.0.0` | Listen address (used if `listen` not set) |
+| `listen_port` | 8443 | Listen port (used if `listen` not set) |
 | `psk` | required | 64 hex chars (32 bytes) pre-shared key |
 | `target_domain` | `www.microsoft.com` | Domain for self-signed TLS cert (camouflage) |
 | `max_connections` | 1000 | Global connection limit |

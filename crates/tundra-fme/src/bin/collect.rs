@@ -1,4 +1,6 @@
 use clap::Parser;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tundra_fme::{library, model::*};
 use std::path::PathBuf;
 
@@ -160,6 +162,3 @@ async fn collect_from_host(host: &str, num_flows: usize) -> anyhow::Result<Traff
 
     Ok(measurements)
 }
-
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};

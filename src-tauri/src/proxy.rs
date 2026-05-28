@@ -8,6 +8,25 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tundra_core::crypto::{Cipher, ROLE_CLIENT, ROLE_SERVER};
 use tundra_core::frame::{Frame, MuxCommand};
+
+async fn read_plaintext_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Frame> {
+    let mut magic_buf = [0u8; 4];
+    reader.read_exact(&mut magic_buf).await?;
+    let magic = u32::from_be_bytes(magic_buf);
+    if magic != tundra_core::MAGIC {
+        anyhow::bail!("invalid magic in handshake frame");
+    }
+    let mut header_buf = [0u8; 7];
+    reader.read_exact(&mut header_buf).await?;
+    let payload_len = u16::from_be_bytes([header_buf[5], header_buf[6]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    let mut full = Vec::with_capacity(11 + payload_len);
+    full.extend_from_slice(&magic_buf);
+    full.extend_from_slice(&header_buf);
+    full.extend_from_slice(&payload);
+    Frame::decode(&full).map_err(|e| anyhow::anyhow!("frame decode: {:?}", e))
+}
 use tundra_core::kem;
 
 type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
@@ -96,13 +115,7 @@ impl ProxyState {
 
         let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
 
-        let mut challenge_buf = vec![0u8; 4096];
-        let challenge_n = tls_r.read(&mut challenge_buf).await?;
-        log::info!("challenge read {} bytes", challenge_n);
-        if challenge_n < 11 {
-            anyhow::bail!("no challenge from server");
-        }
-        let challenge_frame = Frame::decode(&challenge_buf[..challenge_n])?;
+        let challenge_frame = read_plaintext_frame(&mut tls_r).await?;
         if challenge_frame.header.command != MuxCommand::Challenge {
             anyhow::bail!("expected Challenge, got {:?}", challenge_frame.header.command);
         }
@@ -134,15 +147,7 @@ impl ProxyState {
         tls_w.write_all(&auth_frame.encode()).await?;
         log::info!("auth frame sent, waiting for ack");
 
-        let mut buf = vec![0u8; 4096];
-        let n = tls_r.read(&mut buf).await?;
-        log::info!("ack read {} bytes", n);
-        if n < 11 {
-            anyhow::bail!("no auth ack received");
-        }
-
-        let ack_frame = Frame::decode(&buf[..n])?;
-        log::info!("ack decoded, cmd={:?}", ack_frame.header.command);
+        let ack_frame = read_plaintext_frame(&mut tls_r).await?;
         if ack_frame.header.command != MuxCommand::AuthAck {
             anyhow::bail!("bad ack command: {:?}", ack_frame.header.command);
         }
@@ -260,8 +265,9 @@ impl ProxyState {
     }
 
     pub async fn get_stats(&self) -> ProxyStats {
+        let session_guard = self.session.lock().await;
         let mut stats = self.stats.lock().await.clone();
-        if let Some(session) = self.session.lock().await.as_ref() {
+        if let Some(session) = session_guard.as_ref() {
             stats.streams = session.streams.lock().await.len();
             stats.bytes_sent = session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
             stats.bytes_recv = session.bytes_recv.load(std::sync::atomic::Ordering::Relaxed);
@@ -399,7 +405,10 @@ async fn handle_socks5(
                 u16::from_be_bytes(p)
             })
         }
-        _ => anyhow::bail!("unsupported address type"),
+        _ => {
+            let _ = sock.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            anyhow::bail!("unsupported address type");
+        }
     };
 
     let sess_guard = session.lock().await;
@@ -431,6 +440,8 @@ async fn handle_socks5(
     let send_cipher = sess.send_cipher.clone();
     let streams_map = sess.streams.clone();
     let bytes_sent = sess.bytes_sent.clone();
+    let pending_acks = sess.pending_acks.clone();
+
     drop(sess_guard);
 
     match tokio::time::timeout(tokio::time::Duration::from_secs(10), ack_rx).await {
@@ -439,6 +450,7 @@ async fn handle_socks5(
             sock.write_all(&reply).await?;
         }
         _ => {
+            pending_acks.lock().await.remove(&stream_id);
             let reply = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
             let _ = sock.write_all(&reply).await;
             anyhow::bail!("NewStream ack timeout or error for sid={}", stream_id);

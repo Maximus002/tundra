@@ -28,12 +28,12 @@ impl ConnectionLimiter {
     }
 
     pub async fn acquire(&self, ip: IpAddr) -> Result<(), ()> {
-        let current = self.global_count.load(Ordering::Relaxed);
-        if current >= self.max_global {
+        let mut per_ip = self.per_ip.lock().await;
+
+        if self.global_count.load(Ordering::Relaxed) >= self.max_global {
             return Err(());
         }
 
-        let mut per_ip = self.per_ip.lock().await;
         let now = Instant::now();
         let entry = per_ip.entry(ip).or_insert(PerIpEntry { count: 0, last_seen: now });
 
@@ -57,6 +57,12 @@ impl ConnectionLimiter {
                 entry.count = entry.count.saturating_sub(1);
             }
         }
-        self.global_count.fetch_sub(1, Ordering::Relaxed);
+        loop {
+            let current = self.global_count.load(Ordering::Relaxed);
+            if current == 0 { break; }
+            if self.global_count.compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                break;
+            }
+        }
     }
 }

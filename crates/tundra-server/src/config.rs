@@ -4,6 +4,8 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub listen: Option<String>,
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     #[serde(default = "default_listen_port")]
@@ -33,16 +35,26 @@ impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config from {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("failed to parse config from {}", path.display()))
+        let mut cfg: Self = toml::from_str(&content)
+            .with_context(|| format!("failed to parse config from {}", path.display()))?;
+        if let Some(ref listen) = cfg.listen {
+            if let Some((addr, port)) = listen.rsplit_once(':') {
+                cfg.listen_addr = addr.to_string();
+                cfg.listen_port = port.parse().unwrap_or(8443);
+            }
+        }
+        Ok(cfg)
     }
 
     pub fn psk_bytes(&self) -> Result<Option<[u8; 32]>> {
         match &self.psk {
             Some(hex) => {
+                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!("PSK must be exactly 64 hex characters");
+                }
                 let bytes: Vec<u8> = (0..hex.len())
                     .step_by(2)
-                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                     .collect();
                 let arr: [u8; 32] = bytes.as_slice().try_into()
                     .map_err(|_| anyhow::anyhow!("PSK must be exactly 32 bytes (64 hex chars)"))?;

@@ -11,6 +11,7 @@ type FastRng = rand::rngs::SmallRng;
 
 const MTU: usize = 1460;
 const HDR_SIZE: usize = 40;
+const AEAD_PER_FRAME: u64 = 30;
 
 pub struct MorphStats {
     pub bytes_in: u64,
@@ -25,7 +26,8 @@ impl MorphStats {
         if self.bytes_in == 0 {
             return 0.0;
         }
-        (self.bytes_out as f64 - self.bytes_in as f64) / self.bytes_in as f64
+        let wire_overhead = self.packets_out * AEAD_PER_FRAME;
+        (self.bytes_out + wire_overhead - self.bytes_in) as f64 / self.bytes_in as f64
     }
 }
 

@@ -94,6 +94,26 @@ impl SessionPool {
         }
     }
 
+    async fn read_plaintext_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Frame> {
+        let mut magic_buf = [0u8; 4];
+        reader.read_exact(&mut magic_buf).await?;
+        let magic = u32::from_be_bytes(magic_buf);
+        if magic != tundra_core::MAGIC {
+            anyhow::bail!("invalid magic in handshake frame");
+        }
+        let mut header_buf = [0u8; 7];
+        reader.read_exact(&mut header_buf).await?;
+        let payload_len = u16::from_be_bytes([header_buf[5], header_buf[6]]) as usize;
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload).await?;
+
+        let mut full = Vec::with_capacity(11 + payload_len);
+        full.extend_from_slice(&magic_buf);
+        full.extend_from_slice(&header_buf);
+        full.extend_from_slice(&payload);
+        Frame::decode(&full).map_err(|e| anyhow::anyhow!("frame decode: {:?}", e))
+    }
+
     pub fn take_upstream_rx(&mut self) -> Option<mpsc::Receiver<StreamEvent>> {
         self.upstream_rx.take()
     }
@@ -108,10 +128,7 @@ impl SessionPool {
             .context("TLS handshake")?;
         let (mut read, mut w) = tokio::io::split(tls_stream);
 
-        let mut challenge_buf = vec![0u8; 4096];
-        let challenge_n = read.read(&mut challenge_buf).await?;
-        if challenge_n < 11 { anyhow::bail!("no challenge from server"); }
-        let challenge_frame = Frame::decode(&challenge_buf[..challenge_n])?;
+        let challenge_frame = Self::read_plaintext_frame(&mut read).await?;
         if challenge_frame.header.command != MuxCommand::Challenge {
             anyhow::bail!("expected Challenge, got {:?}", challenge_frame.header.command);
         }
@@ -121,7 +138,7 @@ impl SessionPool {
         let kp = kem::generate_hybrid_keypair().context("hybrid KEM keypair")?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let mut auth_payload = Vec::with_capacity(8 + 32 + kem::HYBRID_PK_SIZE);
@@ -143,10 +160,7 @@ impl SessionPool {
         let auth_frame = Frame::new_handshake(MuxCommand::Auth, 0, auth_payload);
         w.write_all(&auth_frame.encode()).await?;
 
-        let mut ack_buf = vec![0u8; 4096];
-        let ack_n = read.read(&mut ack_buf).await?;
-        if ack_n < 11 { anyhow::bail!("no auth ack"); }
-        let ack = Frame::decode(&ack_buf[..ack_n])?;
+        let ack = Self::read_plaintext_frame(&mut read).await?;
         if ack.header.command != MuxCommand::AuthAck { anyhow::bail!("bad ack: {:?}", ack.header.command); }
         if ack.payload.len() < kem::HYBRID_CT_SIZE {
             anyhow::bail!("bad hybrid ct size: {}", ack.payload.len());
@@ -288,76 +302,47 @@ impl SessionPool {
     }
 
     pub async fn get_or_create_session(&self) -> Result<Arc<ActiveSession>> {
-        let should_churn = {
-            let guard = self.active.read().await;
-            if let Some(ref session) = *guard {
-                let age = session.created_at.elapsed();
-                let bytes = session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
-                age > self.max_session_age || bytes > self.max_session_bytes
-            } else {
-                false
-            }
-        };
+        let mut guard = self.active.write().await;
 
-        if should_churn {
-            self.do_handover().await?;
+        if let Some(ref session) = *guard {
+            let age = session.created_at.elapsed();
+            let bytes = session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+            if age > self.max_session_age || bytes > self.max_session_bytes {
+                let old = guard.take();
+                if let Some(old_session) = old {
+                    info!("session churn: handover started (age={:.0}s, bytes={})",
+                          old_session.created_at.elapsed().as_secs_f64(),
+                          old_session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed));
+                    if let Some(ref h) = old_session.fme_handle {
+                        h.abort();
+                    }
+                    let mut drain = self.draining.write().await;
+                    if let Some(ref prev) = *drain {
+                        prev.reader_handle.abort();
+                        if let Some(ref h) = prev.fme_handle {
+                            h.abort();
+                        }
+                    }
+                    *drain = Some(old_session);
+                }
+            }
         }
 
-        {
-            let guard = self.active.read().await;
-            if let Some(ref session) = *guard {
-                return Ok(session.clone());
-            }
+        if let Some(ref session) = *guard {
+            return Ok(session.clone());
         }
+
+        drop(guard);
 
         let session = self.establish_session().await?;
         info!("new TLS session established (fme={})", self.use_fme);
+
         let mut guard = self.active.write().await;
+        if let Some(ref existing) = *guard {
+            return Ok(existing.clone());
+        }
         *guard = Some(session.clone());
         Ok(session)
-    }
-
-    async fn do_handover(&self) -> Result<()> {
-        let old = {
-            let mut guard = self.active.write().await;
-            guard.take()
-        };
-
-        if let Some(old_session) = old {
-            info!("session churn: handover started (age={:.0}s, bytes={})",
-                  old_session.created_at.elapsed().as_secs_f64(),
-                  old_session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed));
-            if let Some(ref h) = old_session.fme_handle {
-                h.abort();
-            }
-            let mut drain = self.draining.write().await;
-            if let Some(ref prev) = *drain {
-                prev.reader_handle.abort();
-                if let Some(ref h) = prev.fme_handle {
-                    h.abort();
-                }
-            }
-            *drain = Some(old_session);
-        }
-
-        let new_session = self.establish_session().await?;
-        info!("handover: new session ready");
-        let mut guard = self.active.write().await;
-        *guard = Some(new_session);
-
-        if self.check_draining_empty().await {
-            let mut drain = self.draining.write().await;
-            if let Some(ref s) = *drain {
-                s.reader_handle.abort();
-                if let Some(ref h) = s.fme_handle {
-                    h.abort();
-                }
-            }
-            *drain = None;
-            info!("handover: drained session cleaned up");
-        }
-
-        Ok(())
     }
 
     async fn check_draining_empty(&self) -> bool {
@@ -436,6 +421,7 @@ impl SessionPool {
     ) -> Result<()> {
         let plaintext = frame.encode();
         let encrypted = cipher.encrypt(&plaintext)?;
+        anyhow::ensure!(encrypted.len() <= u16::MAX as usize, "encrypted frame too large");
         let len = encrypted.len() as u16;
         writer.write_all(&len.to_be_bytes()).await?;
         writer.write_all(&encrypted).await?;

@@ -50,9 +50,12 @@ async fn main() -> Result<()> {
 
     let psk: Option<[u8; 32]> = match &cli.psk {
         Some(hex) => {
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("PSK must be exactly 64 hex characters");
+            }
             let bytes: Vec<u8> = (0..hex.len())
                 .step_by(2)
-                .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
             Some(bytes.try_into().map_err(|_| anyhow::anyhow!("PSK must be 64 hex chars"))?)
         }

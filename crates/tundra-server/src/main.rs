@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
         Some(path) => ServerConfig::load(std::path::Path::new(path))?,
         None => ServerConfig::load(std::path::Path::new("tundra-server.toml")).unwrap_or_else(|_| {
             let default = ServerConfig {
+                listen: None,
                 listen_addr: cli.listen_addr.clone().unwrap_or_else(|| "0.0.0.0".into()),
                 listen_port: cli.listen_port.unwrap_or(8443),
                 target_domain: cli.target_domain.clone().unwrap_or_else(|| "www.microsoft.com".into()),
@@ -158,7 +159,7 @@ fn verify_auth(
     let client_ts = u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     let diff = now.abs_diff(client_ts);
     if diff > AUTH_TTL_SECS {
@@ -215,24 +216,19 @@ async fn handle_connection(
     let challenge_frame = Frame::new_handshake(MuxCommand::Challenge, 0, server_nonce.to_vec());
     tls_write.write_all(&challenge_frame.encode()).await?;
 
-    let mut tmp = vec![0u8; 8192];
-    let n = match tls_read.read(&mut tmp).await {
-        Ok(n) => n,
+    let (initial_data, maybe_frame) = match read_handshake_frame(&mut tls_read).await {
+        Ok(pair) => pair,
         Err(_) => return Ok(()),
     };
 
-    if n < 4 {
-        return Ok(());
-    }
+    let auth_frame = match maybe_frame {
+        Some(f) => f,
+        None => {
+            info!("{} non-tundra traffic -> fallback to target", peer);
+            return fallback::fallback_to_target(tls_read, tls_write, &target_domain, initial_data).await;
+        }
+    };
 
-    let magic = u32::from_be_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
-    if magic != tundra_core::MAGIC {
-        info!("{} non-tundra traffic -> fallback to target", peer);
-        let initial_data = tmp[..n].to_vec();
-        return fallback::fallback_to_target(tls_read, tls_write, &target_domain, initial_data).await;
-    }
-
-    let auth_frame = Frame::decode(&tmp[..n])?;
     let (kyber_pk, x25519_pk) = verify_auth(&auth_frame, &psk, &server_nonce)?;
 
     let enc = kem::hybrid_encapsulate(&kyber_pk, &x25519_pk)
@@ -289,7 +285,17 @@ async fn run_protocol(
 
     loop {
         let mut len_buf = [0u8; 2];
-        client_read.read_exact(&mut len_buf).await?;
+        match tokio::time::timeout(
+            Duration::from_secs(300),
+            client_read.read_exact(&mut len_buf),
+        ).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(_) => {
+                info!("{} idle timeout (300s), closing", peer);
+                break;
+            }
+        }
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 { break; }
         let mut blob = vec![0u8; len];
@@ -340,7 +346,12 @@ async fn run_protocol(
                         let fp = scfg.fme_profile.clone();
                         upstream_tasks.spawn(relay_upstream(client_sid, cw, st, up_read, sc, fp));
                     }
-                    Err(e) => error!("{}:{} failed: {}", host, port, e),
+                    Err(e) => {
+                        error!("{}:{} failed: {}", host, port, e);
+                        let resp = Frame::new(MuxCommand::Close, client_sid, vec![]);
+                        let mut cw = client_write.lock().await;
+                        let _ = write_encrypted_frame(&mut *cw, &server_cipher, &resp).await;
+                    }
                 }
             }
             MuxCommand::Close => { streams.lock().await.remove(&frame.header.stream_id); }
@@ -358,6 +369,33 @@ async fn run_protocol(
     Ok(())
 }
 
+async fn read_handshake_frame<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(Vec<u8>, Option<Frame>)> {
+    let mut initial = vec![0u8; 4];
+    reader.read_exact(&mut initial).await?;
+
+    let magic = u32::from_be_bytes([initial[0], initial[1], initial[2], initial[3]]);
+    if magic != tundra_core::MAGIC {
+        let mut rest = vec![0u8; 8192];
+        let n = reader.read(&mut rest).await.unwrap_or(0);
+        initial.extend_from_slice(&rest[..n]);
+        return Ok((initial, None));
+    }
+
+    let mut header_buf = [0u8; 7];
+    reader.read_exact(&mut header_buf).await?;
+    initial.extend_from_slice(&header_buf);
+
+    let payload_len = u16::from_be_bytes([header_buf[5], header_buf[6]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    initial.extend_from_slice(&payload);
+
+    let frame = Frame::decode(&initial)?;
+    Ok((initial, Some(frame)))
+}
+
 async fn write_encrypted_frame(
     writer: &mut (impl AsyncWriteExt + Unpin),
     cipher: &Cipher,
@@ -365,6 +403,7 @@ async fn write_encrypted_frame(
 ) -> Result<()> {
     let plaintext = frame.encode();
     let encrypted = cipher.encrypt(&plaintext)?;
+    anyhow::ensure!(encrypted.len() <= u16::MAX as usize, "encrypted frame too large");
     let len = encrypted.len() as u16;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&encrypted).await?;
@@ -383,7 +422,7 @@ async fn relay_upstream(
     let mut morpher = Morpher::new(model);
 
     loop {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 8192];
         let n = match upstream_read.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,

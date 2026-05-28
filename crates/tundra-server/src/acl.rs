@@ -22,6 +22,10 @@ fn is_private_ip(addr: IpAddr) -> bool {
                 || (octets[0] == 192 && octets[1] == 168)
                 || (octets[0] == 169 && octets[1] == 254)
                 || octets[0] == 0
+                || octets[0] >= 240
+                || (octets[0] == 224)
+                || (octets[0] == 255)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {

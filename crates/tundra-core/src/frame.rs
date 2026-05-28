@@ -99,6 +99,8 @@ impl Frame {
     }
 
     pub fn new_padded(command: MuxCommand, stream_id: u32, data: Vec<u8>, total_payload_len: usize) -> Self {
+        assert!(data.len() <= u16::MAX as usize, "padded frame data too large");
+        assert!(total_payload_len <= u16::MAX as usize, "padded frame total too large");
         let real_len = data.len() as u16;
         let target = total_payload_len.max(2 + data.len());
         let mut payload = Vec::with_capacity(target);
