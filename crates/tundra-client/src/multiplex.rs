@@ -45,6 +45,7 @@ pub struct ActiveSession {
     next_stream_id: std::sync::atomic::AtomicU32,
     pub streams: Arc<Mutex<Vec<u32>>>,
     pending_tx: Option<mpsc::Sender<PendingWrite>>,
+    _quic_endpoint: Option<quinn::Endpoint>,
 }
 
 pub struct SessionPool {
@@ -123,7 +124,7 @@ impl SessionPool {
     }
 
     async fn establish_session(&self) -> Result<Arc<ActiveSession>> {
-        let (mut read, mut w): (BoxedRead, BoxedWrite) = if self.transport == "quic" {
+        let ((mut read, mut w), quic_endpoint): ((BoxedRead, BoxedWrite), Option<quinn::Endpoint>) = if self.transport == "quic" {
             let mut crypto = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -149,9 +150,12 @@ impl SessionPool {
                 .context("QUIC connect")?
                 .await
                 .context("QUIC handshake")?;
-            let (send, recv) = conn.open_bi().await
+            let (send, recv) = tokio::time::timeout(Duration::from_secs(10), conn.open_bi())
+                .await
+                .context("QUIC open_bi timeout")?
                 .context("QUIC open_bi")?;
-            (Box::pin(recv) as BoxedRead, Box::pin(send) as BoxedWrite)
+            let boxed = (Box::pin(recv) as BoxedRead, Box::pin(send) as BoxedWrite);
+            (boxed, Some(endpoint))
         } else {
             let tcp = TcpStream::connect(&self.server_addr).await
                 .context("connect to server")?;
@@ -161,7 +165,7 @@ impl SessionPool {
             let tls_stream = connector.connect(server_name, tcp).await
                 .context("TLS handshake")?;
             let (r, w) = tokio::io::split(tls_stream);
-            (Box::pin(r) as BoxedRead, Box::pin(w) as BoxedWrite)
+            ((Box::pin(r) as BoxedRead, Box::pin(w) as BoxedWrite), None)
         };
 
         let challenge_frame = Self::read_plaintext_frame(&mut read).await?;
@@ -299,6 +303,7 @@ impl SessionPool {
             next_stream_id: std::sync::atomic::AtomicU32::new(1),
             streams,
             pending_tx,
+            _quic_endpoint: quic_endpoint,
         }))
     }
 

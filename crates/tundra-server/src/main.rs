@@ -122,14 +122,17 @@ async fn main() -> Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel::<(quinn::Connection, std::net::SocketAddr)>(64);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
+                info!("QUIC incoming connection...");
                 match incoming.await {
                     Ok(conn) => {
                         let peer = conn.remote_address();
+                        info!("QUIC connection established from {}", peer);
                         let _ = tx.send((conn, peer)).await;
                     }
                     Err(e) => warn!("QUIC incoming error: {}", e),
                 }
             }
+            info!("QUIC accept loop ended");
         });
         Some(rx)
     } else {
