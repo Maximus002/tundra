@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub handshake_timeout_secs: u64,
     #[serde(default = "default_fme_profile")]
     pub fme_profile: String,
+    #[serde(default)]
+    pub enable_quic: bool,
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 fn default_listen_addr() -> String { "0.0.0.0".into() }

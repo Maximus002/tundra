@@ -1,3 +1,12 @@
+async fn maybe_recv_quic(rx: &mut Option<tokio::sync::mpsc::Receiver<(quinn::Connection, std::net::SocketAddr)>>) -> Option<(quinn::Connection, std::net::SocketAddr)> {
+    match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => {
+            std::future::pending().await
+        }
+    }
+}
+
 mod acl;
 mod config;
 mod fallback;
@@ -20,9 +29,7 @@ use tundra_core::kem;
 use tundra_fme::library::model_from_profile;
 use tundra_fme::model::Direction as FmeDirection;
 use tundra_fme::morpher::Morpher;
-use tracing::{error, info, warn};
-
-#[derive(Parser)]
+use tracing::{error, info, warn};#[derive(Parser)]
 #[command(name = "tundra-server", version)]
 struct Cli {
     #[arg(long)]
@@ -60,6 +67,8 @@ async fn main() -> Result<()> {
                 max_per_ip: 10,
                 handshake_timeout_secs: 10,
                 fme_profile: "browser".into(),
+                enable_quic: false,
+                quic_port: None,
             };
             warn!("no config file found, using defaults");
             default
@@ -86,6 +95,46 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind to {}", addr))?;
+
+    let mut quic_rx = if cfg.enable_quic {
+        let quic_addr = format!("{}:{}", cfg.listen_addr, cfg.quic_port.unwrap_or(cfg.listen_port));
+        let rustls_cfg = tls_config.rustls_config();
+        let quic_server_config: quinn::ServerConfig =
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn_proto::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
+                    .map_err(|e| anyhow::anyhow!("QUIC server config: {:?}", e))?
+            ));
+        let mut server_config = quic_server_config;
+        let transport = {
+            let mut t = quinn::TransportConfig::default();
+            t.keep_alive_interval(Some(Duration::from_secs(5)));
+            Arc::new(t)
+        };
+        server_config.transport_config(transport);
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        server_config.transport_config(Arc::new(transport));
+
+        let endpoint = quinn::Endpoint::server(server_config, quic_addr.parse::<std::net::SocketAddr>()?)
+            .with_context(|| "failed to create QUIC endpoint")?;
+        info!("QUIC listening on {}", endpoint.local_addr().unwrap());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<(quinn::Connection, std::net::SocketAddr)>(64);
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                match incoming.await {
+                    Ok(conn) => {
+                        let peer = conn.remote_address();
+                        let _ = tx.send((conn, peer)).await;
+                    }
+                    Err(e) => warn!("QUIC incoming error: {}", e),
+                }
+            }
+        });
+        Some(rx)
+    } else {
+        None
+    };
 
     let mut tasks: JoinSet<()> = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();
@@ -115,6 +164,28 @@ async fn main() -> Result<()> {
                         error!("{} error: {}", peer, e);
                     }
                 });
+            }
+            quic_conn = maybe_recv_quic(&mut quic_rx) => {
+                if let Some((conn, peer)) = quic_conn {
+                    let lim = limiter.clone();
+                    let psk_ref = psk.clone();
+                    let cfg_ref = cfg.clone();
+
+                    if lim.acquire(peer.ip()).await.is_err() {
+                        warn!("{} QUIC connection rejected (limit)", peer);
+                        continue;
+                    }
+
+                    tasks.spawn(async move {
+                        let _guard = ConnectionGuard {
+                            limiter: lim.clone(),
+                            ip: peer.ip(),
+                        };
+                        if let Err(e) = handle_quic_connection(conn, peer, psk_ref, cfg_ref).await {
+                            error!("{} QUIC error: {}", peer, e);
+                        }
+                    });
+                }
             }
             _ = &mut shutdown => {
                 info!("shutting down, waiting for {} active connections...", tasks.len());
@@ -270,14 +341,97 @@ async fn handle_connection(
     run_protocol(tls_read, tls_write, peer, client_cipher, server_cipher, scfg).await
 }
 
-async fn run_protocol(
-    mut client_read: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-    client_write: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+async fn handle_quic_connection(
+    conn: quinn::Connection,
+    peer: std::net::SocketAddr,
+    psk: Arc<Option<[u8; 32]>>,
+    scfg: Arc<ServerConfig>,
+) -> Result<()> {
+    let (mut send, mut recv) = conn.accept_bi().await
+        .with_context(|| format!("QUIC accept_bi failed for {}", peer))?;
+
+    info!("{} QUIC bi-stream opened", peer);
+
+    let mut server_nonce = [0u8; CHALLENGE_SIZE];
+    use rand::RngCore;
+    rand::rng().fill_bytes(&mut server_nonce);
+    let challenge_frame = Frame::new_handshake(MuxCommand::Challenge, 0, server_nonce.to_vec());
+    send.write_all(&challenge_frame.encode()).await?;
+
+    let auth_frame = read_plaintext_frame(&mut recv).await
+        .with_context(|| format!("QUIC handshake read failed for {}", peer))?;
+
+    let (kyber_pk, x25519_pk) = verify_auth(&auth_frame, &psk, &server_nonce)?;
+
+    let enc = kem::hybrid_encapsulate(&kyber_pk, &x25519_pk)
+        .map_err(|e| anyhow::anyhow!("hybrid KEM encapsulate failed: {:?}", e))?;
+
+    let server_enc_key = crypto::derive_key(&enc.shared_secret, b"server-enc");
+    let client_enc_key = crypto::derive_key(&enc.shared_secret, b"client-enc");
+    let server_cipher = Arc::new(Cipher::new_with_role(&server_enc_key, ROLE_SERVER));
+    let client_cipher = Cipher::new_with_role(&client_enc_key, ROLE_CLIENT);
+
+    let mut ack_payload = Vec::with_capacity(AUTH_ACK_SIZE);
+    ack_payload.extend_from_slice(&enc.kyber_ct);
+    ack_payload.extend_from_slice(&enc.x25519_ct);
+    let ack = Frame::new_handshake(MuxCommand::AuthAck, 0, ack_payload);
+    send.write_all(&ack.encode()).await?;
+
+    let kc_hash = blake3::keyed_hash(&server_enc_key, b"tundra-key-confirm-s2c");
+    let kc_frame = Frame::new(MuxCommand::KeyConfirm, 0, kc_hash.as_bytes().to_vec());
+    write_encrypted_frame(&mut send, &server_cipher, &kc_frame).await?;
+
+    let mut kc_len_buf = [0u8; 2];
+    recv.read_exact(&mut kc_len_buf).await?;
+    let kc_len = u16::from_be_bytes(kc_len_buf) as usize;
+    if kc_len == 0 { anyhow::bail!("empty key confirm"); }
+    let mut kc_blob = vec![0u8; kc_len];
+    recv.read_exact(&mut kc_blob).await?;
+    let kc_plain = client_cipher.decrypt(&kc_blob)?;
+    let kc_received = Frame::decode(&kc_plain)?;
+    if kc_received.header.command != MuxCommand::KeyConfirm {
+        anyhow::bail!("expected KeyConfirm from client, got {:?}", kc_received.header.command);
+    }
+    let expected_c2s = blake3::keyed_hash(&client_enc_key, b"tundra-key-confirm-c2s");
+    if !crypto::constant_time_eq(kc_received.payload.get(..32).unwrap_or(&[]), expected_c2s.as_bytes()) {
+        anyhow::bail!("client KeyConfirm mismatch");
+    }
+
+    info!("{} QUIC auth ok (hybrid KEM, key confirmed)", peer);
+
+    run_protocol(recv, send, peer, client_cipher, server_cipher, scfg).await
+}
+
+async fn read_plaintext_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Frame> {
+    let mut magic_buf = [0u8; 4];
+    reader.read_exact(&mut magic_buf).await?;
+    let magic = u32::from_be_bytes(magic_buf);
+    if magic != tundra_core::MAGIC {
+        anyhow::bail!("invalid magic in handshake frame");
+    }
+    let mut header_buf = [0u8; 7];
+    reader.read_exact(&mut header_buf).await?;
+    let payload_len = u16::from_be_bytes([header_buf[5], header_buf[6]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    let mut full = Vec::with_capacity(11 + payload_len);
+    full.extend_from_slice(&magic_buf);
+    full.extend_from_slice(&header_buf);
+    full.extend_from_slice(&payload);
+    Frame::decode(&full).map_err(|e| anyhow::anyhow!("frame decode: {:?}", e))
+}
+async fn run_protocol<R, W>(
+    mut client_read: R,
+    client_write: W,
     peer: std::net::SocketAddr,
     client_cipher: Cipher,
     server_cipher: Arc<Cipher>,
     scfg: Arc<ServerConfig>,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     let client_write = Arc::new(tokio::sync::Mutex::new(client_write));
     let streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -410,14 +564,16 @@ async fn write_encrypted_frame(
     Ok(())
 }
 
-async fn relay_upstream(
+async fn relay_upstream<W>(
     stream_id: u32,
-    client_write: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>,
+    client_write: Arc<tokio::sync::Mutex<W>>,
     streams: Arc<tokio::sync::Mutex<HashMap<u32, tokio::net::tcp::OwnedWriteHalf>>>,
     mut upstream_read: tokio::net::tcp::OwnedReadHalf,
     server_cipher: Arc<Cipher>,
     fme_profile: String,
-) {
+) where
+    W: AsyncWriteExt + Unpin + Send,
+{
     let model = model_from_profile(&fme_profile);
     let mut morpher = Morpher::new(model);
 

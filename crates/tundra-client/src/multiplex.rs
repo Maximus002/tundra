@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::pin::Pin;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,9 +15,9 @@ use tundra_fme::morpher::Morpher;
 use tracing::{debug, info};
 
 use tokio::time::Duration;
-use tokio_rustls::client::TlsStream;
 
-type BoxedWrite = tokio::io::WriteHalf<TlsStream<TcpStream>>;
+type BoxedWrite = Pin<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>;
+type BoxedRead = Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
 
 struct MorpherWrapper {
     morpher: Morpher,
@@ -56,6 +57,7 @@ pub struct SessionPool {
     max_session_bytes: u64,
     use_fme: bool,
     fme_profile: String,
+    transport: String,
     upstream_tx: mpsc::Sender<StreamEvent>,
     upstream_rx: Option<mpsc::Receiver<StreamEvent>>,
 }
@@ -77,6 +79,7 @@ impl SessionPool {
         max_session_bytes: u64,
         use_fme: bool,
         fme_profile: String,
+        transport: String,
     ) -> Self {
         let (upstream_tx, upstream_rx) = mpsc::channel(256);
         Self {
@@ -89,6 +92,7 @@ impl SessionPool {
             max_session_bytes,
             use_fme,
             fme_profile,
+            transport,
             upstream_tx,
             upstream_rx: Some(upstream_rx),
         }
@@ -119,14 +123,46 @@ impl SessionPool {
     }
 
     async fn establish_session(&self) -> Result<Arc<ActiveSession>> {
-        let tcp = TcpStream::connect(&self.server_addr).await
-            .context("connect to server")?;
-        let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
-        let server_name = "tundra-server".try_into()
-            .map_err(|e| anyhow::anyhow!("bad server name: {:?}", e))?;
-        let tls_stream = connector.connect(server_name, tcp).await
-            .context("TLS handshake")?;
-        let (mut read, mut w) = tokio::io::split(tls_stream);
+        let (mut read, mut w): (BoxedRead, BoxedWrite) = if self.transport == "quic" {
+            let mut crypto = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            crypto.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec()];
+            let quinn_client_config = quinn::ClientConfig::new(Arc::new(
+                quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(crypto))
+                    .map_err(|e| anyhow::anyhow!("QUIC client config: {:?}", e))?
+            ));
+            let mut opts = quinn::TransportConfig::default();
+            opts.keep_alive_interval(Some(Duration::from_secs(5)));
+            let mut qcfg = quinn_client_config;
+            qcfg.transport_config(Arc::new(opts));
+
+            let addr = self.server_addr.parse::<std::net::SocketAddr>()
+                .context("invalid server address for QUIC")?;
+            let server_name = "tundra-server";
+            let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
+                .context("QUIC client endpoint")?;
+            endpoint.set_default_client_config(qcfg);
+
+            let conn = endpoint.connect(addr, server_name)
+                .context("QUIC connect")?
+                .await
+                .context("QUIC handshake")?;
+            let (send, recv) = conn.open_bi().await
+                .context("QUIC open_bi")?;
+            (Box::pin(recv) as BoxedRead, Box::pin(send) as BoxedWrite)
+        } else {
+            let tcp = TcpStream::connect(&self.server_addr).await
+                .context("connect to server")?;
+            let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
+            let server_name = "tundra-server".try_into()
+                .map_err(|e| anyhow::anyhow!("bad server name: {:?}", e))?;
+            let tls_stream = connector.connect(server_name, tcp).await
+                .context("TLS handshake")?;
+            let (r, w) = tokio::io::split(tls_stream);
+            (Box::pin(r) as BoxedRead, Box::pin(w) as BoxedWrite)
+        };
 
         let challenge_frame = Self::read_plaintext_frame(&mut read).await?;
         if challenge_frame.header.command != MuxCommand::Challenge {
@@ -205,7 +241,6 @@ impl SessionPool {
         let write: Arc<Mutex<BoxedWrite>> = Arc::new(Mutex::new(w));
 
         let streams: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-        let streams_clone = streams.clone();
         let upstream_tx = self.upstream_tx.clone();
 
         let reader_handle = tokio::spawn(async move {
@@ -225,14 +260,8 @@ impl SessionPool {
                                     }).await;
                                 }
                             }
-                            MuxCommand::Close => {
-                                let _ = upstream_tx.send(StreamEvent {
-                                    stream_id: sid,
-                                    data: vec![],
-                                    is_close: true,
-                                }).await;
-                                streams_clone.lock().await.retain(|&s| s != sid);
-                            }
+                            MuxCommand::NewStream => {}
+                            MuxCommand::Close => {}
                             _ => {}
                         }
                     }
@@ -241,7 +270,7 @@ impl SessionPool {
             }
         });
 
-            let (pending_tx, fme_handle) = if self.use_fme {
+        let (pending_tx, fme_handle) = if self.use_fme {
                 let (ptx, prx) = mpsc::channel::<PendingWrite>(256);
                 let model = model_from_profile(&self.fme_profile);
                 let scheduler = Arc::new(Mutex::new(MorpherWrapper {
@@ -455,5 +484,48 @@ impl SessionPool {
                 h.abort();
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+        ]
     }
 }

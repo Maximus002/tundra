@@ -6,6 +6,7 @@ use tracing::info;
 
 pub struct TlsConfig {
     acceptor: TlsAcceptor,
+    rustls_config: Arc<rustls::ServerConfig>,
 }
 
 impl TlsConfig {
@@ -26,16 +27,22 @@ impl TlsConfig {
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| anyhow::anyhow!("tls config: {}", e))?;
 
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let rustls_config = Arc::new(server_config);
+        let acceptor = TlsAcceptor::from(rustls_config.clone());
 
         info!("TLS: self-signed cert for {}", target_domain);
 
         Ok(Self {
             acceptor,
+            rustls_config,
         })
     }
 
     pub fn acceptor(&self) -> &TlsAcceptor {
         &self.acceptor
+    }
+
+    pub fn rustls_config(&self) -> Arc<rustls::ServerConfig> {
+        self.rustls_config.clone()
     }
 }

@@ -32,6 +32,8 @@ struct Cli {
     fme: bool,
     #[arg(long, default_value = "browser")]
     fme_profile: String,
+    #[arg(long, default_value = "tcp", value_parser = ["tcp", "quic"])]
+    transport: String,
 }
 
 #[tokio::main]
@@ -72,6 +74,7 @@ async fn main() -> Result<()> {
         cli.max_session_bytes_mb * 1024 * 1024,
         cli.fme,
         cli.fme_profile.clone(),
+        cli.transport.clone(),
     );
 
     let upstream_rx = pool.take_upstream_rx()
@@ -79,8 +82,8 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(pool);
 
-    info!("SOCKS5 on {} -> {} (psk={}, fme={}, profile={}, max_age={}s, max_bytes={}MB)",
-          socks_addr, server_addr, psk.is_some(), cli.fme, cli.fme_profile,
+    info!("SOCKS5 on {} -> {} (psk={}, fme={}, profile={}, transport={}, max_age={}s, max_bytes={}MB)",
+          socks_addr, server_addr, psk.is_some(), cli.fme, cli.fme_profile, cli.transport,
           cli.max_session_age_secs, cli.max_session_bytes_mb);
 
     let listener = TcpListener::bind(&socks_addr).await?;
