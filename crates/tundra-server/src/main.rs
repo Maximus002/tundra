@@ -360,6 +360,13 @@ async fn handle_quic_connection(
 
     info!("{} QUIC bi-stream opened", peer);
 
+    let mut ready_buf = [0u8; 18];
+    recv.read_exact(&mut ready_buf).await
+        .with_context(|| format!("QUIC ready signal read for {}", peer))?;
+    if &ready_buf != b"TUNDRA_QUIC_READY\n" {
+        anyhow::bail!("bad QUIC ready signal from {}", peer);
+    }
+
     let mut server_nonce = [0u8; CHALLENGE_SIZE];
     use rand::RngCore;
     rand::rng().fill_bytes(&mut server_nonce);

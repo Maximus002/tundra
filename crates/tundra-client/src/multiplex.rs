@@ -142,7 +142,8 @@ impl SessionPool {
             let addr = self.server_addr.parse::<std::net::SocketAddr>()
                 .context("invalid server address for QUIC")?;
             let server_name = "tundra-server";
-            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+            let bind_addr: std::net::SocketAddr = if addr.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+            let mut endpoint = quinn::Endpoint::client(bind_addr)
                 .context("QUIC client endpoint")?;
             endpoint.set_default_client_config(qcfg);
 
@@ -150,10 +151,14 @@ impl SessionPool {
                 .context("QUIC connect")?
                 .await
                 .context("QUIC handshake")?;
-            let (send, recv) = tokio::time::timeout(Duration::from_secs(10), conn.open_bi())
+            info!("QUIC connected, opening bi-stream...");
+            let (mut send, recv) = tokio::time::timeout(Duration::from_secs(10), conn.open_bi())
                 .await
                 .context("QUIC open_bi timeout")?
                 .context("QUIC open_bi")?;
+            send.write_all(b"TUNDRA_QUIC_READY\n").await.context("QUIC ready signal")?;
+            send.flush().await.context("QUIC flush ready")?;
+            info!("QUIC bi-stream opened + ready signal sent");
             let boxed = (Box::pin(recv) as BoxedRead, Box::pin(send) as BoxedWrite);
             (boxed, Some(endpoint))
         } else {
