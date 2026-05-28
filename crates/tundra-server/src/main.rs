@@ -169,7 +169,9 @@ async fn main() -> Result<()> {
                 });
             }
             quic_conn = maybe_recv_quic(&mut quic_rx) => {
+                info!("QUIC select! branch triggered");
                 if let Some((conn, peer)) = quic_conn {
+                    info!("{} QUIC dispatching to handler", peer);
                     let lim = limiter.clone();
                     let psk_ref = psk.clone();
                     let cfg_ref = cfg.clone();
